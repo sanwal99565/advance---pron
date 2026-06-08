@@ -1,0 +1,2167 @@
+# -*- coding: utf-8 -*-
+import telebot
+from telebot import types
+import qrcode
+import time
+import threading
+from datetime import datetime, timedelta
+import logging
+from io import BytesIO
+import json
+import os
+import sys
+
+# Import config and verification
+import config
+from config import *
+from verif import init_verification
+
+# Initialize bot
+# Use config.BOT_TOKEN to avoid NameError if star import hasn't processed it yet
+_token = getattr(config, 'BOT_TOKEN', os.getenv("BOT_TOKEN", ""))
+
+if not _token or ":" not in _token:
+    print("\n❌ ERROR: BOT_TOKEN is missing or invalid in .env file!")
+    print("Please make sure you have created a .env file with BOT_TOKEN=your_token_here")
+    sys.exit(1)
+
+bot = telebot.TeleBot(_token, parse_mode="HTML")
+
+# Initialize verification system
+verif = init_verification(bot)
+
+def is_admin(user_id):
+    """Check if a user is an admin"""
+    admin_ids = settings.get('admin_ids', [])
+    
+    # Sync admins from .env into settings if needed
+    changed = False
+    for env_id in ADMIN_IDS_ENV:
+        if str(env_id) not in [str(aid) for aid in admin_ids]:
+            admin_ids.append(str(env_id))
+            changed = True
+            
+    if changed:
+        settings['admin_ids'] = admin_ids
+        save_settings()
+        
+    # Convert all to strings for comparison
+    return str(user_id) in [str(aid) for aid in admin_ids]
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Auto-save thread
+def auto_save_data():
+    while True:
+        time.sleep(300)
+        save_all_data()
+
+auto_save_thread = threading.Thread(target=auto_save_data, daemon=True)
+auto_save_thread.start()
+
+# Notify Admin about MongoDB status on startup
+def notify_mongo_status():
+    try:
+        if config.mongo_error:
+            admin_ids = settings.get('admin_ids', [])
+            if admin_ids:
+                msg = f"⚠️ <b>MongoDB Connection Failed!</b>\n\nError: <code>{config.mongo_error}</code>\n\n💡 Bot is running on <b>Local JSON</b> mode. Your data will be saved locally in the <code>data/</code> folder."
+                for aid in admin_ids:
+                    try:
+                        bot.send_message(aid, msg, parse_mode="HTML")
+                    except:
+                        continue
+    except Exception as e:
+        logging.error(f"Notify Mongo Status Error: {e}")
+
+# Run notification in a separate thread to not block startup
+threading.Thread(target=notify_mongo_status, daemon=True).start()
+
+def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=False):
+    """Delete a message after a specified delay and optionally send a timeout message"""
+    def delete():
+        try:
+            bot.delete_message(chat_id, message_id)
+            logging.info(f"Successfully deleted message {message_id} in {chat_id}")
+            if send_timeout_msg:
+                bot.send_message(
+                    chat_id, 
+                    "<b>⏰ Session Timed Out!</b>\n\nThe payment QR code has been deleted for security. Please use /start to generate a new one.",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            logging.warning(f"Failed to delete message {message_id} in {chat_id}: {e}")
+            
+    # Start timer
+    timer = threading.Timer(delay, delete)
+    timer.daemon = True # Ensure thread doesn't block exit
+    timer.start()
+    logging.info(f"Scheduled deletion for message {message_id} in {chat_id} after {delay} seconds")
+
+def send_demo_videos(chat_id, video_list):
+    """Send a group of demo videos/photos and schedule deletion after 10 minutes"""
+    if not video_list:
+        return
+    
+    media = []
+    for item in video_list:
+        try:
+            if isinstance(item, dict):
+                fid = item.get('id')
+                ftype = item.get('type', 'video')
+                if ftype == 'photo':
+                    media.append(types.InputMediaPhoto(fid))
+                else:
+                    media.append(types.InputMediaVideo(fid))
+            else:
+                # OLD FORMAT HANDLING: Try to determine if it's a photo or video
+                # Since we can't know for sure without API call, we'll try to send as video first
+                # but this is what causes the 400 error if it's a photo.
+                # To fix this, we advise admin to CLEAR and RESET demos using new reply method.
+                media.append(types.InputMediaVideo(item))
+        except Exception as e:
+            logging.error(f"Error preparing media item: {e}")
+            continue
+    
+    if not media:
+        return
+
+    try:
+        msgs = bot.send_media_group(chat_id, media)
+        # Schedule deletion for each message in the group after 10 minutes (600s)
+        for m in msgs:
+            delete_message_after_delay(chat_id, m.message_id, delay=600)
+    except Exception as e:
+        logging.error(f"Error sending demo videos: {e}")
+        # Notify admin about the error if it's a type mismatch
+        if "can't use file of type Photo as Video" in str(e) or "can't use file of type Video as Photo" in str(e):
+            admin_ids = settings.get('admin_ids', [])
+            if admin_ids:
+                error_msg = "⚠️ <b>Demo Media Error!</b>\n\nSome of your demo files have the wrong type (Photo instead of Video or vice-versa).\n\n✅ <b>Solution:</b>\n1. Use <code>/clear_start_demos</code>\n2. Use <code>/clear_plan_demos [plan_id]</code>\n3. Set them again by <b>REPLYING</b> to the videos/photos."
+                for aid in admin_ids:
+                    try: bot.send_message(aid, error_msg, parse_mode="HTML")
+                    except: pass
+
+def initialize_spam_data():
+    """Ensure all existing users have spam_data entries"""
+    initialized = 0
+    for user_id_str in users_data.keys():
+        if user_id_str not in spam_data:
+            spam_data[user_id_str] = {
+                "requests": [],
+                "warnings": 0,
+                "blocked_until": 0,
+                "block_level": 0,
+                "ban_reason": "",
+                "banned_by": 0
+            }
+            initialized += 1
+    if initialized > 0:
+        print(f"Initialized spam data for {initialized} users")
+
+# ========== FORCE JOIN REQUEST HANDLER REMOVED ==========
+
+# ============ SPAM PROTECTION FUNCTIONS ============
+def update_user_activity(user_id):
+    user_id_str = str(user_id)
+    current_time = time.time()
+    
+    if user_id_str not in spam_data:
+        spam_data[user_id_str] = {
+            "requests": [],
+            "warnings": 0,
+            "blocked_until": 0,
+            "block_level": 0,
+            "ban_reason": "",
+            "banned_by": 0
+        }
+    
+    if "requests" not in spam_data[user_id_str]:
+        spam_data[user_id_str]["requests"] = []
+    
+    spam_data[user_id_str]["requests"] = [
+        ts for ts in spam_data[user_id_str]["requests"] 
+        if current_time - ts < SPAM_TIME_WINDOW
+    ]
+    
+    spam_data[user_id_str]["requests"].append(current_time)
+    return len(spam_data[user_id_str]["requests"])
+
+def check_user_blocked(user_id):
+    user_id_str = str(user_id)
+    
+    if user_id_str not in spam_data:
+        return False, None
+    
+    user_data = spam_data[user_id_str]
+    
+    if "blocked_until" not in user_data:
+        user_data["blocked_until"] = 0
+    
+    current_time = time.time()
+    
+    if user_data["blocked_until"] > current_time:
+        time_left = int(user_data["blocked_until"] - current_time)
+        minutes = time_left // 60
+        seconds = time_left % 60
+        hours = minutes // 60
+        minutes = minutes % 60
+        
+        warning_msg = f"⛔ <b>YOU ARE BLOCKED!</b>\n\n"
+        
+        if user_data.get("ban_reason"):
+            warning_msg += f"<b>Reason:</b> {user_data['ban_reason']}\n"
+        
+        if hours > 0:
+            warning_msg += f"⏳ Please wait <b>{hours} hours {minutes} minutes</b>\n\n"
+        else:
+            warning_msg += f"⏳ Please wait <b>{minutes}:{seconds:02d}</b>\n\n"
+        
+        return True, warning_msg
+    
+    return False, None
+
+def check_spam(user_id):
+    user_id_str = str(user_id)
+    
+    is_blocked, block_msg = check_user_blocked(user_id)
+    if is_blocked:
+        return block_msg
+    
+    current_time = time.time()
+    request_count = update_user_activity(user_id)
+    
+    if "warnings" not in spam_data[user_id_str]:
+        spam_data[user_id_str]["warnings"] = 0
+    if "block_level" not in spam_data[user_id_str]:
+        spam_data[user_id_str]["block_level"] = 0
+    if "blocked_until" not in spam_data[user_id_str]:
+        spam_data[user_id_str]["blocked_until"] = 0
+    
+    if request_count >= MAX_SPAM_COUNT:
+        user_data = spam_data[user_id_str]
+        user_data["block_level"] = min(2, user_data.get("block_level", 0) + 1)
+        block_duration = BLOCK_DURATIONS[user_data["block_level"]]
+        user_data["blocked_until"] = current_time + block_duration
+        user_data["requests"] = []
+        user_data["warnings"] = 0
+        
+        # Notify admin
+        try:
+            admin_msg = f"""
+🚨 <b>USER BLOCKED FOR SPAM</b>
+
+👤 User ID: <code>{user_id}</code>
+📛 Block Level: {user_data['block_level'] + 1}
+⏰ Duration: {block_duration//60} minutes
+🔢 Spam Count: {request_count}
+            """
+            for aid in settings.get('admin_ids', []):
+                try:
+                    bot.send_message(aid, admin_msg, parse_mode="HTML")
+                except:
+                    continue
+        except:
+            pass
+        
+        minutes = block_duration // 60
+        seconds = block_duration % 60
+        
+        return f"⛔ <b>BLOCKED FOR SPAM!</b>\n\n⏳ Wait {minutes}:{seconds:02d}"
+    
+    if request_count >= 3:
+        warning_level = min(2, request_count - 3)
+        if spam_data[user_id_str].get("warnings", 0) < warning_level + 1:
+            spam_data[user_id_str]["warnings"] = warning_level + 1
+            warning_msg = f"{WARNING_MESSAGES[warning_level]}\n\n⚠️ {MAX_SPAM_COUNT - request_count} attempts left!"
+            try:
+                bot.send_message(user_id, warning_msg, parse_mode="HTML")
+            except:
+                pass
+    
+    return None
+
+def reset_spam_counter(user_id):
+    user_id_str = str(user_id)
+    if user_id_str in spam_data:
+        if spam_data[user_id_str].get("blocked_until", 0) < time.time():
+            spam_data[user_id_str]["requests"] = []
+            spam_data[user_id_str]["warnings"] = 0
+
+def ban_user(user_id, duration_seconds, reason="", banned_by=None):
+    if banned_by is None:
+        banned_by = settings.get('admin_ids', [None])[0]
+    user_id_str = str(user_id)
+    current_time = time.time()
+    
+    if user_id_str not in spam_data:
+        spam_data[user_id_str] = {
+            "requests": [],
+            "warnings": 0,
+            "blocked_until": 0,
+            "block_level": 0,
+            "ban_reason": reason,
+            "banned_by": banned_by
+        }
+    
+    spam_data[user_id_str]["blocked_until"] = current_time + duration_seconds
+    spam_data[user_id_str]["ban_reason"] = reason
+    spam_data[user_id_str]["banned_by"] = banned_by
+    spam_data[user_id_str]["block_level"] = 3
+    
+    try:
+        if duration_seconds >= 3600:
+            time_display = f"{int(duration_seconds/3600)} hours"
+        elif duration_seconds >= 60:
+            time_display = f"{int(duration_seconds/60)} minutes"
+        else:
+            time_display = f"{duration_seconds} seconds"
+        
+        bot.send_message(
+            int(user_id),
+            f"⛔ <b>BANNED</b>\n\nDuration: {time_display}\nReason: {reason}",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    
+    return True
+
+# ============ PREMIUM BOT CLASS ============
+class PremiumBot:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+    
+    def generate_qr_code(self, upi_id, amount, name):
+        try:
+            # Format amount to 2 decimal places for UPI standard
+            formatted_amount = "{:.2f}".format(float(amount))
+            upi_url = f"upi://pay?pa={upi_id}&pn={name.replace(' ', '%20')}&am={formatted_amount}&cu=INR"
+            
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=10,
+                border=4,
+            )
+            qr.add_data(upi_url)
+            qr.make(fit=True)
+            
+            img = qr.make_image(fill_color="black", back_color="white")
+            img_bytes = BytesIO()
+            img.save(img_bytes, format='PNG')
+            img_bytes.seek(0)
+            return img_bytes
+        except Exception as e:
+            logging.error(f"QR Generation Error: {e}")
+            return None
+
+premium_bot = PremiumBot()
+
+# ========== IMPORTANT LOGS ==========
+def log_important_event(event_type, user_data=None, plan=None):
+    try:
+        if not settings.get('log_channel'):
+            return
+            
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        if event_type == "new_user":
+            log_msg = f"""
+🆕 <b>NEW USER</b>
+👤 Name: {user_data.get('first_name', 'N/A')}
+👤 User: @{user_data.get('username' , 'N/A')}
+🆔 ID: <code>{user_data.get('id', 'N/A')}</code>
+⏰ Time: {timestamp}
+📊 Total Users: {len(users_data)}
+            """
+        elif event_type == "payment_initiated":
+            log_msg = f"""
+💰 <b>PAYMENT INITIATED</b>
+👤 Name: {user_data.get('first_name', 'N/A')}
+👤 User: @{user_data.get('username', 'N/A')}
+🆔 ID: <code>{user_data.get('id', 'N/A')}</code>
+📅 Plan: {plan}
+⏰ Time: {timestamp}
+            """
+        else:
+            return
+        
+        target_chat = settings.get('log_channel')
+        if not target_chat:
+            target_chat = settings.get('admin_ids', [None])[0]
+            
+        if target_chat:
+            bot.send_message(target_chat, log_msg, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Log error: {e}")
+
+# ========== /START COMMAND ==========
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    try:
+        user_id = message.from_user.id
+        
+        # Force Join check removed
+            
+        spam_result = check_spam(user_id)
+        if spam_result:
+            bot.send_message(message.chat.id, spam_result, parse_mode="HTML")
+            return
+
+        # NEW: Send Start Demo Videos (Deleted after 10 min)
+        start_demos = settings.get('start_demo_videos', [])
+        if start_demos:
+            send_demo_videos(message.chat.id, start_demos)
+            
+        is_new_user = str(user_id) not in users_data
+        
+        if is_new_user:
+            users_data[str(user_id)] = {
+                'id': user_id,
+                'username': message.from_user.username,
+                'first_name': message.from_user.first_name,
+                'last_name': message.from_user.last_name or "",
+                'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'is_premium': False
+            }
+            log_important_event("new_user", users_data[str(user_id)])
+        
+        reset_spam_counter(user_id)
+        
+        # Check if custom start message exists
+        if start_message_data and 'has_media' in start_message_data:
+            text = start_message_data.get('text', "")
+            
+            if start_message_data['has_media']:
+                media_type = start_message_data.get('media_type', '')
+                file_id = start_message_data.get('file_id', '')
+                
+                if media_type == 'photo' and file_id:
+                    bot.send_photo(
+                        message.chat.id,
+                        photo=file_id,
+                        caption=text,
+                        reply_markup=verif.main_menu_keyboard(),
+                        parse_mode="HTML"
+                    )
+                elif media_type == 'video' and file_id:
+                    bot.send_video(
+                        message.chat.id,
+                        video=file_id,
+                        caption=text,
+                        reply_markup=verif.main_menu_keyboard(),
+                        parse_mode="HTML"
+                    )
+                else:
+                    send_default_start(message)
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    text,
+                    reply_markup=verif.main_menu_keyboard(),
+                    parse_mode="HTML"
+                )
+        else:
+            send_default_start(message)
+        
+    except Exception as e:
+        logging.error(f"Start error: {e}")
+
+def send_default_start(message):
+    welcome_text = f"""
+🔥 <b>PREMIUM CONTENT</b> 🔥
+
+Welcome to the Premium Bot! Access high-quality exclusive content.
+
+👇 <b>Select an option:</b>
+    """
+    
+    bot.send_message(
+        message.chat.id,
+        welcome_text,
+        reply_markup=verif.main_menu_keyboard(),
+        parse_mode="HTML"
+    )
+
+# ========== CHECK JOINED CALLBACK REMOVED ==========
+
+# ========== GET MEMBERSHIP CALLBACK REMOVED ==========
+
+@bot.callback_query_handler(func=lambda call: call.data == "main_menu")
+def handle_main_menu_callback(call):
+    try:
+        welcome_text = f"""
+🔥 <b>PREMIUM CONTENT</b> 🔥
+
+Welcome to the Premium Bot! Access high-quality exclusive content.
+
+👇 <b>Select an option:</b>
+        """
+        bot.edit_message_text(
+            welcome_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=verif.main_menu_keyboard(),
+            parse_mode="HTML"
+        )
+    except:
+        handle_start(call.message)
+    bot.answer_callback_query(call.id)
+
+# ========== PLAN SELECTION ==========
+@bot.callback_query_handler(func=lambda call: call.data.startswith('plan_'))
+def handle_plan_selection(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    
+    # Check membership removed
+        
+    spam_result = check_spam(user_id)
+    if spam_result:
+        bot.send_message(chat_id, spam_result, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+    
+    reset_spam_counter(user_id)
+    
+    # Check if user already has a pending verification
+    if str(user_id) in pending_verifications:
+        existing = pending_verifications[str(user_id)]
+        if 'screenshot_file_id' in existing:
+            bot.answer_callback_query(
+                call.id,
+                "⚠️ You already have a pending verification! Please wait for admin to verify your previous payment.",
+                show_alert=True
+            )
+            return
+
+    plan_type = call.data.split('_')[1]  # monthly or lifetime
+    plan = config.PLANS[plan_type]
+
+    # NEW: Send Plan Demo Videos (Deleted after 10 min)
+    plan_demos = settings.get('plan_demo_videos', {}).get(plan_type, [])
+    if plan_demos:
+        send_demo_videos(chat_id, plan_demos)
+    
+    # Increment total orders for sequential order number
+    settings['total_orders'] = settings.get('total_orders', 0) + 1
+    order_num = settings['total_orders']
+    save_settings()
+
+    # Store in pending verifications
+    pending_verifications[str(user_id)] = {
+        'plan': plan_type,
+        'amount': plan['amount'],
+        'order_number': order_num,
+        'initiated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'username': call.from_user.username,
+        'first_name': call.from_user.first_name
+    }
+    # save_json_file(PENDING_VERIF_FILE, pending_verifications) # Removed for batch saving
+    
+    # Log payment initiation
+    if str(user_id) in users_data:
+        log_important_event("payment_initiated", users_data[str(user_id)], f"{plan['name']} (Order #{order_num})")
+    
+    # Delete previous message
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except:
+        pass
+    
+    # Generate QR code
+    qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
+    
+    if qr_image:
+        caption = f"""
+<b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
+
+<b>UPI Details:</b>
+└ ID: <code>{settings['upi_id']}</code>
+└ Name: {settings['upi_name']}
+└ Amount: <b>₹{plan['amount']}</b>
+
+<b>Instructions:</b>
+1. Scan QR with any UPI app
+2. Pay ₹{plan['amount']}
+3. Click "✅ Payment Done" below
+
+⏳ <i>This QR will auto-delete in 5 minutes.</i>
+        """
+        
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        btn1 = types.InlineKeyboardButton("✅ Payment Done", callback_data="payment_done")
+        keyboard.add(btn1)
+        
+        sent_msg = bot.send_photo(
+            chat_id,
+            photo=qr_image,
+            caption=caption,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        # Auto-delete after 5 minutes
+        delete_message_after_delay(chat_id, sent_msg.message_id, 300, send_timeout_msg=True)
+    else:
+        manual_text = f"""
+<b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
+
+<b>UPI ID:</b> <code>{settings['upi_id']}</code>
+<b>Amount:</b> ₹{plan['amount']}
+
+<b>Steps:</b>
+1. Send ₹{plan['amount']} to above UPI ID
+2. Click "✅ Payment Done" below
+
+⏳ <i>This message will auto-delete in 5 minutes.</i>
+        """
+        
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        btn1 = types.InlineKeyboardButton("✅ Payment Done", callback_data="payment_done")
+        keyboard.add(btn1)
+        
+        sent_msg = bot.send_message(
+            chat_id,
+            manual_text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        # Auto-delete after 5 minutes
+        delete_message_after_delay(chat_id, sent_msg.message_id, 300, send_timeout_msg=True)
+    
+    bot.answer_callback_query(call.id)
+
+# ========== HOW TO GET REMOVED ==========
+
+@bot.callback_query_handler(func=lambda call: call.data in ["demo_not_set", "support_not_set", "proof_not_set"])
+def handle_not_set_alerts(call):
+    text = "This is not configured by admin yet."
+    if call.data == "support_not_set":
+        text = "Support username is not configured yet."
+    elif call.data == "proof_not_set":
+        text = "Payment proof channel link is not configured yet."
+    bot.answer_callback_query(call.id, text, show_alert=True)
+
+# ========== GET PREMIUM ==========
+@bot.callback_query_handler(func=lambda call: call.data == "get_premium")
+def handle_get_premium(call):
+    user_id = call.from_user.id
+    
+    # Check membership removed
+        
+    spam_result = check_spam(user_id)
+    if spam_result:
+        bot.send_message(call.message.chat.id, spam_result, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+    
+    reset_spam_counter(user_id)
+    
+    try:
+        bot.edit_message_text(
+            "👇 <b>Choose your membership plan:</b>",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=verif.plan_selection_keyboard(),
+            parse_mode="HTML"
+        )
+    except:
+        bot.send_message(
+            call.message.chat.id,
+            "👇 <b>Choose your membership plan:</b>",
+            reply_markup=verif.plan_selection_keyboard(),
+            parse_mode="HTML"
+        )
+    
+    bot.answer_callback_query(call.id)
+
+# ========== PAYMENT DONE ==========
+@bot.callback_query_handler(func=lambda call: call.data == "payment_done")
+def handle_payment_done(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    
+    spam_result = check_spam(user_id)
+    if spam_result:
+        bot.send_message(chat_id, spam_result, parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+    
+    reset_spam_counter(user_id)
+    
+    # Check if user has selected a plan
+    if str(user_id) not in pending_verifications:
+        bot.answer_callback_query(
+            call.id, 
+            "Please select a plan first!", 
+            show_alert=True
+        )
+        return
+    
+    # Delete previous message
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except:
+        pass
+    
+    # Ask for screenshot
+    verif.ask_for_screenshot(chat_id, user_id, pending_verifications[str(user_id)]['plan'])
+    
+    bot.answer_callback_query(call.id)
+
+# ========== HANDLE SCREENSHOTS & FILE IDs ==========
+@bot.message_handler(content_types=['photo', 'video', 'document'])
+def handle_admin_files(message):
+    user_id = message.from_user.id
+    
+    # 1. If admin sends a video/photo, show them the file_id (for setting demos)
+    if is_admin(user_id):
+        file_id = None
+        file_type = None
+        
+        if message.video:
+            file_id = message.video.file_id
+            file_type = "Video"
+        elif message.photo:
+            file_id = message.photo[-1].file_id
+            file_type = "Photo"
+        elif message.document:
+            file_id = message.document.file_id
+            file_type = "Document/Video"
+            
+        if file_id:
+            # Auto-forward to backup channel if set
+            backup_ch = settings.get('backup_channel')
+            forward_status = ""
+            if backup_ch:
+                try:
+                    bot.forward_message(backup_ch, message.chat.id, message.message_id)
+                    forward_status = f"\n✅ <b>Stored in Backup Channel:</b> <code>{backup_ch}</code>"
+                except Exception as e:
+                    forward_status = f"\n❌ <b>Backup Failed:</b> {str(e)}"
+            
+            bot.reply_to(
+                message, 
+                f"<b>📄 {file_type} File ID:</b>\n\n<code>{file_id}</code>\n{forward_status}\n\nUse this ID in <code>/set_start_demos</code> or <code>/set_plan_demos</code>", 
+                parse_mode="HTML"
+            )
+            # If it was just for file_id, we can return. But if it was a photo, it might be a payment screenshot.
+            if message.video or message.document:
+                return
+
+    # 2. Check if this is a payment screenshot (for users or admin testing)
+    if message.photo:
+        if verif.handle_screenshot(message):
+            return
+
+# ========== VERIFICATION CALLBACKS ==========
+@bot.callback_query_handler(func=lambda call: call.data.startswith('verify_'))
+def handle_verify(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Admin only!")
+        return
+    
+    user_id = call.data.split('_')[1]
+    
+    success, msg = verif.verify_payment(user_id, call.from_user.id)
+    
+    if success:
+        bot.answer_callback_query(call.id, "✅ Payment verified! Unique join link sent to user.")
+        
+        # Update the admin message
+        try:
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=call.message.caption + "\n\n✅ <b>VERIFIED - UNIQUE LINK SENT</b>",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+    else:
+        bot.answer_callback_query(call.id, f"❌ Error: {msg}", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reject_'))
+def handle_reject(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Admin only!")
+        return
+    
+    user_id = call.data.split('_')[1]
+    
+    success, msg = verif.reject_payment(user_id, call.from_user.id)
+    
+    if success:
+        bot.answer_callback_query(call.id, "❌ Payment rejected. User notified.")
+        
+        # Update the admin message
+        try:
+            bot.edit_message_caption(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                caption=call.message.caption + "\n\n❌ <b>REJECTED</b>",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+    else:
+        bot.answer_callback_query(call.id, f"❌ Error: {msg}", show_alert=True)
+
+# ========== /VERIFY COMMAND ==========
+@bot.message_handler(commands=['verify'])
+def handle_manual_verify(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        bot.reply_to(
+            message,
+            "Usage: /verify [user_id]\nExample: /verify 123456789"
+        )
+        return
+    
+    user_id = args[1]
+    
+    if user_id not in pending_verifications:
+        bot.reply_to(message, "❌ User not in pending verifications")
+        return
+    
+    success, msg = verif.verify_payment(user_id, message.from_user.id)
+    bot.reply_to(message, msg)
+
+# ========== /SETTINGS COMMAND (FIXED HTML) ==========
+@bot.message_handler(commands=['settings'])
+def handle_settings(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    # Premium Channels List
+    ch_info = ""
+    for ch in settings.get('premium_channels', []):
+        ch_id_display = ch.get('channel_id', ch.get('channel_ids', 'Not Set'))
+        ch_info += f"• {ch.get('id', '??')}: {ch.get('name', 'Unknown')} (₹{ch.get('amount', '0')}) - <code>{ch_id_display}</code>\n"
+    
+    text = f"""
+<b>⚙️ CURRENT SETTINGS</b>
+
+<b>👑 Admins:</b> <code>{', '.join(settings.get('admin_ids', []))}</code>
+<b>📢 Demo Link:</b> {settings.get('demo_channel_link', 'Not Set')}
+<b>🆔 Demo ID:</b> <code>{settings.get('demo_channel_id', 'Not Set')}</code>
+<b>💰 Demo Price:</b> ₹{settings.get('demo_amount', '10')}
+<b>🔄 Demo Status:</b> {'PAID' if settings.get('demo_paid_status', False) else 'FREE'}
+
+<b> Log Channel:</b> {settings.get('log_channel', 'Not Set')}
+<b>🛡️ Force Join:</b> {'ON' if settings.get('force_join_status', True) else 'OFF'}
+<b>🤖 Auto-Accept:</b> {'ON' if settings.get('auto_accept_requests', False) else 'OFF'}
+<b>🧾 Proof Channel:</b> {settings.get('payment_proof_link', 'Not Set')}
+<b>🧾 Proof Status:</b> {'ON' if settings.get('payment_proof_status', False) else 'OFF'}
+
+<b>💰 UPI Settings:</b>
+• UPI ID: <code>{settings.get('upi_id', 'Not Set')}</code>
+• Name: {settings.get('upi_name', 'Not Set')}
+
+<b>📺 Premium Channels:</b>
+{ch_info}
+<b>To change settings, use specific commands in /help</b>
+    """
+    
+    bot.reply_to(message, text, parse_mode="HTML")
+
+# ========== /SET COMMAND (FIXED HTML) ==========
+@bot.message_handler(commands=['set'])
+def handle_set(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        bot.reply_to(message, "Usage: /set [key] [value]\nExample: /set monthly_amount 129")
+        return
+    
+    key = args[1].lower()
+    value = args[2]
+    
+    # Map keys to settings
+    key_map = {
+        "demo_channel": "demo_channel_link",
+        "support": "support_username",
+        "log_channel": "log_channel",
+        "upi_id": "upi_id",
+        "upi_name": "upi_name",
+        "monthly_name": "monthly_name",
+        "monthly_amount": "monthly_amount",
+        "monthly_channel": "monthly_channel_id",
+        "lifetime_name": "lifetime_name",
+        "lifetime_amount": "lifetime_amount",
+        "lifetime_channel": "lifetime_channel_id"
+    }
+    
+    if key not in key_map:
+        bot.reply_to(message, f"❌ Invalid key. Available: {', '.join(key_map.keys())}")
+        return
+    
+    settings[key_map[key]] = value
+    save_settings()
+    
+    bot.reply_to(message, f"✅ Updated {key} to: {value}")
+
+@bot.message_handler(commands=['ban'])
+def handle_ban(message):
+    bot.reply_to(message, "❌ Ban system has been removed from this bot.")
+
+@bot.message_handler(commands=['unban'])
+def handle_unban(message):
+    bot.reply_to(message, "❌ Ban system has been removed from this bot.")
+
+@bot.message_handler(commands=['banlist'])
+def handle_banlist(message):
+    bot.reply_to(message, "❌ Ban system has been removed from this bot.")
+
+# ========== /BROADCAST COMMAND ==========
+@bot.message_handler(commands=['broadcast'])
+def handle_broadcast(message):
+    """Broadcast message to all users"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    if not message.reply_to_message:
+        help_text = """
+<b>📢 BROADCAST COMMAND</b>
+
+<code>Reply to any message with /broadcast</code>
+
+<b>Supported:</b> Text, Photos, Videos, Documents, GIFs
+
+<b>How to use:</b>
+1. Send the message you want to broadcast
+2. Reply to it with <code>/broadcast</code>
+        """
+        bot.reply_to(message, help_text, parse_mode="HTML")
+        return
+    
+    replied_msg = message.reply_to_message
+    progress_msg = bot.reply_to(message, "📤 <b>Broadcast Starting...</b>", parse_mode="HTML")
+    
+    total_users = len(users_data)
+    if total_users == 0:
+        bot.edit_message_text("❌ No users to broadcast", chat_id=message.chat.id, message_id=progress_msg.message_id)
+        return
+    
+    def broadcast_thread():
+        sent = 0
+        failed = 0
+        skipped = 0
+        user_ids = list(users_data.keys())
+        
+        for idx, user_id_str in enumerate(user_ids):
+            try:
+                user_id = int(user_id_str)
+                
+                # Skip if blocked
+                if user_id_str in spam_data:
+                    if spam_data[user_id_str].get("blocked_until", 0) > time.time():
+                        skipped += 1
+                        continue
+                
+                # Send based on type
+                if replied_msg.photo:
+                    bot.send_photo(
+                        user_id, 
+                        photo=replied_msg.photo[-1].file_id, 
+                        caption=replied_msg.caption or "", 
+                        parse_mode="HTML"
+                    )
+                elif replied_msg.video:
+                    bot.send_video(
+                        user_id, 
+                        video=replied_msg.video.file_id, 
+                        caption=replied_msg.caption or "", 
+                        parse_mode="HTML"
+                    )
+                elif replied_msg.document:
+                    bot.send_document(
+                        user_id, 
+                        document=replied_msg.document.file_id, 
+                        caption=replied_msg.caption or "", 
+                        parse_mode="HTML"
+                    )
+                elif replied_msg.animation:
+                    bot.send_animation(
+                        user_id, 
+                        animation=replied_msg.animation.file_id, 
+                        caption=replied_msg.caption or "", 
+                        parse_mode="HTML"
+                    )
+                elif replied_msg.text:
+                    bot.send_message(user_id, replied_msg.text, parse_mode="HTML")
+                elif replied_msg.caption:
+                    bot.send_message(user_id, replied_msg.caption, parse_mode="HTML")
+                
+                sent += 1
+                
+                # Update progress every 50 users
+                if (idx + 1) % 50 == 0:
+                    percent = int((idx + 1) / total_users * 100)
+                    try:
+                        bot.edit_message_text(
+                            f"📤 Broadcasting... {percent}% ({sent} sent, {failed} failed)", 
+                            chat_id=message.chat.id, 
+                            message_id=progress_msg.message_id
+                        )
+                    except:
+                        pass
+                
+                time.sleep(0.05)  # Rate limit protection
+                
+            except Exception as e:
+                failed += 1
+                # Auto-remove dead users
+                error_str = str(e).lower()
+                if "forbidden" in error_str or "blocked" in error_str or "deactivated" in error_str:
+                    if user_id_str in users_data:
+                        del users_data[user_id_str]
+        
+        # Save all data after broadcast complete
+        save_all_data()
+        
+        final_text = f"""
+✅ <b>BROADCAST COMPLETE!</b>
+
+📊 <b>Results:</b>
+• ✅ Sent: {sent}
+• ❌ Failed: {failed}
+• ⏭️ Skipped: {skipped}
+• 👥 Total: {total_users}
+        """
+        
+        try:
+            bot.edit_message_text(
+                final_text, 
+                chat_id=message.chat.id, 
+                message_id=progress_msg.message_id, 
+                parse_mode="HTML"
+            )
+        except:
+            pass
+    
+    thread = threading.Thread(target=broadcast_thread)
+    thread.start()
+    
+    bot.reply_to(message, f"📢 Broadcast started to {total_users} users!")
+
+# ========== /STATS COMMAND ==========
+@bot.message_handler(commands=['stats'])
+def handle_stats(message):
+    """Show bot statistics"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    current_time = time.time()
+    blocked_users = sum(1 for u in spam_data.values() if u.get("blocked_until", 0) > current_time)
+    pending_count = len(pending_verifications)
+    
+    today = datetime.now().strftime('%Y-%m-%d')
+    new_today = sum(1 for u in users_data.values() if u.get('start_time', '').startswith(today))
+    
+    # Count premium users
+    premium_users = sum(1 for u in users_data.values() if u.get('is_premium', False))
+    
+    # Dynamic Pricing Info
+    pricing_info = ""
+    for ch in settings.get('premium_channels', []):
+        pricing_info += f"• {ch['name']}: ₹{ch['amount']}\n"
+    if not pricing_info:
+        pricing_info = "• No channels configured\n"
+        
+    stats_text = f"""
+<b>📊 BOT STATISTICS</b>
+
+👥 <b>Users:</b>
+• Total Users: {len(users_data)}
+• Premium Users: {premium_users}
+• New Today: {new_today}
+• Pending Verification: {pending_count}
+
+🛡️ <b>Spam Protection:</b>
+• Currently Blocked: {blocked_users}
+• Tracked Users: {len(spam_data)}
+
+📩 <b>Join Requests:</b>
+• Pending Tracked: {len(join_requests)}
+
+💰 <b>Pricing Info:</b>
+{pricing_info}• Demo: ₹{settings.get('demo_amount', '10')} ({'PAID' if settings.get('demo_paid_status') else 'FREE'})
+
+📁 <b>Storage:</b>
+• Data Files: {len(os.listdir(DATA_DIR))}
+
+🚀 <b>Status:</b> ✅ Running
+    """
+    bot.reply_to(message, stats_text, parse_mode="HTML")
+
+# ========== /SALES COMMAND ==========
+@bot.message_handler(commands=['sales'])
+def handle_sales(message):
+    """Show sales statistics (Daily, Weekly, Monthly)"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+    
+    daily_total = 0
+    weekly_total = 0
+    monthly_total = 0
+    
+    upi_sales = {} # Track sales per UPI ID
+    
+    for sale in sales_data:
+        try:
+            sale_date = datetime.strptime(sale['date'], "%Y-%m-%d")
+            amount = float(sale['amount'])
+            upi = sale.get('upi_id', 'Unknown')
+            
+            if upi not in upi_sales:
+                upi_sales[upi] = 0
+            
+            if sale['date'] == today_str:
+                daily_total += amount
+                upi_sales[upi] += amount
+            
+            if sale_date >= week_ago:
+                weekly_total += amount
+            
+            if sale_date >= month_ago:
+                monthly_total += amount
+        except:
+            continue
+            
+    upi_info = ""
+    for upi, amt in upi_sales.items():
+        upi_info += f"• <code>{upi}</code>: ₹{amt}\n"
+        
+    sales_text = f"""
+<b>💰 SALES STATISTICS</b>
+
+📅 <b>Total Revenue:</b>
+• <b>Daily:</b> ₹{daily_total}
+• <b>Weekly:</b> ₹{weekly_total}
+• <b>Monthly:</b> ₹{monthly_total}
+
+💳 <b>Revenue by UPI (Today):</b>
+{upi_info if upi_info else '• No sales today'}
+
+📊 <b>Total Transactions:</b> {len(sales_data)}
+    """
+    bot.reply_to(message, sales_text, parse_mode="HTML")
+
+# ========== /ADMIN COMMANDS (NEW) ==========
+@bot.message_handler(commands=['add_admin'])
+def handle_add_admin(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/add_admin user_id</code>", parse_mode="HTML")
+        return
+        
+    new_admin = args[1].strip()
+    if 'admin_ids' not in settings:
+        settings['admin_ids'] = []
+        
+    if new_admin not in settings['admin_ids']:
+        settings['admin_ids'].append(new_admin)
+        save_settings()
+        bot.reply_to(message, f"✅ User <code>{new_admin}</code> added to admins.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "User is already an admin.")
+
+@bot.message_handler(commands=['remove_admin'])
+def handle_remove_admin(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/remove_admin user_id</code>", parse_mode="HTML")
+        return
+        
+    admin_to_remove = args[1].strip()
+    
+    # Don't allow removing the last admin
+    if len(settings.get('admin_ids', [])) <= 1:
+        bot.reply_to(message, "❌ Cannot remove the last admin.")
+        return
+        
+    if admin_to_remove in settings.get('admin_ids', []):
+        settings['admin_ids'].remove(admin_to_remove)
+        save_settings()
+        bot.reply_to(message, f"✅ User <code>{admin_to_remove}</code> removed from admins.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "User is not in admin list.")
+
+# Legacy channel commands removed
+
+@bot.message_handler(commands=['demo_toggle'])
+def handle_demo_toggle(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    current_status = settings.get('demo_paid_status', False)
+    new_status = not current_status
+    settings['demo_paid_status'] = new_status
+    save_settings()
+
+    status_text = "PAID" if new_status else "FREE"
+    bot.reply_to(message, f"✅ Demo is now <b>{status_text}</b>.", parse_mode="HTML")
+
+@bot.message_handler(commands=['demo_price'])
+def handle_demo_price(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/demo_price amount</code>", parse_mode="HTML")
+        return
+
+    amount = args[1]
+    settings['demo_amount'] = amount
+    save_settings()
+    bot.reply_to(message, f"✅ Demo price set to <b>₹{amount}</b>.", parse_mode="HTML")
+
+@bot.message_handler(commands=['set_demo_ch'])
+def handle_set_demo_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/set_demo_ch channel_id</code>", parse_mode="HTML")
+        return
+
+    ch_id = args[1]
+    settings['demo_channel_id'] = ch_id
+    save_settings()
+    bot.reply_to(message, f"✅ Demo Channel ID set to: <code>{ch_id}</code>", parse_mode="HTML")
+
+@bot.message_handler(commands=['set_demo_link'])
+def handle_set_demo_link(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/set_demo_link https://t.me/xxx</code>", parse_mode="HTML")
+        return
+
+    url = args[1]
+    settings['demo_channel_link'] = url
+    save_settings()
+    bot.reply_to(message, f"✅ Demo Channel Link set to: {url}")
+
+# Support and Force Join toggles removed
+
+@bot.message_handler(commands=['proof_toggle'])
+def handle_proof_toggle(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    current = settings.get("payment_proof_status", False)
+    settings["payment_proof_status"] = not current
+    save_settings()
+
+    status = "ON" if settings["payment_proof_status"] else "OFF"
+    bot.reply_to(message, f"✅ Payment Proof button is now <b>{status}</b>.", parse_mode="HTML")
+
+@bot.message_handler(commands=['set_proof_link'])
+def handle_set_proof_link(message):
+    if not is_admin(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/set_proof_link [url]</code>", parse_mode="HTML")
+        return
+
+    url = args[1]
+    settings['payment_proof_link'] = url
+    save_settings()
+    bot.reply_to(message, f"✅ Payment Proof Link set to: {url}", parse_mode="HTML")
+
+# set_buy_url removed
+
+@bot.message_handler(commands=['set_backup_ch'])
+def handle_set_backup_ch(message):
+    """Set the channel for auto-storing demo videos"""
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/set_backup_ch channel_id</code>", parse_mode="HTML")
+        return
+        
+    ch_id = args[1]
+    settings['backup_channel'] = ch_id
+    save_settings()
+    bot.reply_to(message, f"✅ Backup channel set to: <code>{ch_id}</code>\nAll videos you send to bot will be auto-forwarded here.", parse_mode="HTML")
+
+# ========== DEMO VIDEO MANAGEMENT ==========
+@bot.message_handler(commands=['set_start_demos'])
+def handle_set_start_demos(message):
+    """Set demo videos for /start. Support reply to media or space-separated file_ids."""
+    if not is_admin(message.from_user.id):
+        return
+    
+    # 1. Handle Reply to Media
+    if message.reply_to_message:
+        reply = message.reply_to_message
+        fid = None
+        ftype = None
+        
+        if reply.video:
+            fid = reply.video.file_id
+            ftype = 'video'
+        elif reply.photo:
+            fid = reply.photo[-1].file_id
+            ftype = 'photo'
+        elif reply.document:
+            fid = reply.document.file_id
+            # Check if it's a photo or video based on mime_type
+            mime = reply.document.mime_type or ""
+            if "video" in mime:
+                ftype = 'video'
+            elif "image" in mime:
+                ftype = 'photo'
+            else:
+                ftype = 'video' # Default fallback
+            
+        if fid:
+            if 'start_demo_videos' not in settings:
+                settings['start_demo_videos'] = []
+            
+            # Check if already in list
+            exists = any(isinstance(x, dict) and x.get('id') == fid for x in settings['start_demo_videos'])
+            if not exists:
+                settings['start_demo_videos'].append({"id": fid, "type": ftype})
+                save_settings()
+                bot.reply_to(message, f"✅ Added {ftype} to /start demos. Total: {len(settings['start_demo_videos'])}")
+            else:
+                bot.reply_to(message, "❌ This media is already in the /start demos list.")
+        else:
+            bot.reply_to(message, "❌ Please reply to a video or photo to add it to demos.")
+        return
+
+    # 2. Handle Space-separated file_ids (Overwrite mode)
+    args = message.text.split()[1:]
+    if not args:
+        bot.reply_to(message, "Usage: Reply to a video/photo with <code>/set_start_demos</code>\nOR use <code>/set_start_demos file_id1 file_id2 ...</code>", parse_mode="HTML")
+        return
+    
+    # Convert IDs to new format (assume video for IDs)
+    new_list = [{"id": fid, "type": "video"} for fid in args]
+    settings['start_demo_videos'] = new_list
+    save_settings()
+    bot.reply_to(message, f"✅ Set {len(args)} demo videos for /start (Overwrite).")
+
+@bot.message_handler(commands=['clear_start_demos'])
+def handle_clear_start_demos(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    settings['start_demo_videos'] = []
+    save_settings()
+    bot.reply_to(message, "✅ Cleared /start demo videos.")
+
+@bot.message_handler(commands=['set_plan_demos'])
+def handle_set_plan_demos(message):
+    """Set demo videos for a plan. Support reply to media or space-separated file_ids."""
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/set_plan_demos plan_id [file_id1 file_id2 ...]</code>", parse_mode="HTML")
+        return
+        
+    plan_id = args[1]
+    
+    # 1. Handle Reply to Media (Append mode)
+    if message.reply_to_message:
+        reply = message.reply_to_message
+        fid = None
+        ftype = None
+        
+        if reply.video:
+            fid = reply.video.file_id
+            ftype = 'video'
+        elif reply.photo:
+            fid = reply.photo[-1].file_id
+            ftype = 'photo'
+        elif reply.document:
+            fid = reply.document.file_id
+            # Check mime_type
+            mime = reply.document.mime_type or ""
+            if "video" in mime:
+                ftype = 'video'
+            elif "image" in mime:
+                ftype = 'photo'
+            else:
+                ftype = 'video'
+            
+        if fid:
+            if 'plan_demo_videos' not in settings:
+                settings['plan_demo_videos'] = {}
+            if plan_id not in settings['plan_demo_videos']:
+                settings['plan_demo_videos'][plan_id] = []
+                
+            # Check if already in list
+            exists = any(isinstance(x, dict) and x.get('id') == fid for x in settings['plan_demo_videos'][plan_id])
+            if not exists:
+                settings['plan_demo_videos'][plan_id].append({"id": fid, "type": ftype})
+                save_settings()
+                bot.reply_to(message, f"✅ Added {ftype} to demos for plan <code>{plan_id}</code>. Total: {len(settings['plan_demo_videos'][plan_id])}", parse_mode="HTML")
+            else:
+                bot.reply_to(message, f"❌ This media is already in the demos list for plan <code>{plan_id}</code>.", parse_mode="HTML")
+        else:
+            bot.reply_to(message, "❌ Please reply to a video or photo to add it to plan demos.")
+        return
+
+    # 2. Handle Space-separated file_ids (Overwrite mode)
+    if len(args) < 3:
+        bot.reply_to(message, "Usage: Reply to a video/photo with <code>/set_plan_demos plan_id</code>\nOR use <code>/set_plan_demos plan_id file_id1 file_id2 ...</code>", parse_mode="HTML")
+        return
+        
+    video_ids = args[2:]
+    if 'plan_demo_videos' not in settings:
+        settings['plan_demo_videos'] = {}
+        
+    # Convert IDs to new format
+    new_list = [{"id": fid, "type": "video"} for fid in video_ids]
+    settings['plan_demo_videos'][plan_id] = new_list
+    save_settings()
+    bot.reply_to(message, f"✅ Set {len(video_ids)} demo videos for plan: <code>{plan_id}</code> (Overwrite)", parse_mode="HTML")
+
+@bot.message_handler(commands=['clear_plan_demos'])
+def handle_clear_plan_demos(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/clear_plan_demos plan_id</code>", parse_mode="HTML")
+        return
+    
+    plan_id = args[1]
+    if 'plan_demo_videos' in settings and plan_id in settings['plan_demo_videos']:
+        del settings['plan_demo_videos'][plan_id]
+        save_settings()
+        bot.reply_to(message, f"✅ Cleared demo videos for plan: <code>{plan_id}</code>", parse_mode="HTML")
+    else:
+        bot.reply_to(message, f"❌ No demo videos found for plan: <code>{plan_id}</code>", parse_mode="HTML")
+
+@bot.message_handler(commands=['add_premium_ch'])
+def handle_add_premium_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    try:
+        # Split by spaces
+        args = message.text.split()
+        if len(args) < 5:
+            bot.reply_to(message, "Usage: <code>/add_premium_ch id Full Name price channel_id</code>\nExample: <code>/add_premium_ch ch1 Randi Ki Dukan 99 -100xxx</code>", parse_mode="HTML")
+            return
+            
+        # ID is always 2nd element
+        ch_id = args[1]
+        
+        # Last two elements are always price and channel_id
+        telegram_id = args[-1]
+        price = args[-2]
+        
+        # Everything in between is the name
+        name = " ".join(args[2:-2])
+        
+        if 'premium_channels' not in settings:
+            settings['premium_channels'] = []
+            
+        # Check if id already exists
+        for ch in settings['premium_channels']:
+            if ch['id'] == ch_id:
+                bot.reply_to(message, f"❌ ID {ch_id} already exists.")
+                return
+                
+        settings['premium_channels'].append({
+            "id": ch_id,
+            "name": name,
+            "amount": price,
+            "channel_id": telegram_id,
+            "duration": "30 Days"
+        })
+        save_settings()
+        bot.reply_to(message, f"✅ Added <b>{name}</b> (₹{price}) to membership list.", parse_mode="HTML")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.message_handler(commands=['remove_premium_ch'])
+def handle_remove_premium_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/remove_premium_ch id</code>", parse_mode="HTML")
+        return
+        
+    ch_id = args[1]
+    found = False
+    for i, ch in enumerate(settings.get('premium_channels', [])):
+        if ch['id'] == ch_id:
+            settings['premium_channels'].pop(i)
+            found = True
+            break
+            
+    if found:
+        save_settings()
+        bot.reply_to(message, f"✅ Removed channel {ch_id}.")
+    else:
+        bot.reply_to(message, f"❌ Channel ID {ch_id} not found.")
+
+@bot.message_handler(commands=['edit_premium_ch'])
+def handle_edit_premium_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    try:
+        args = message.text.split()
+        if len(args) < 4:
+            bot.reply_to(message, "Usage: <code>/edit_premium_ch id key New Value</code>\nKeys: <code>name, amount, channel_id, duration</code>", parse_mode="HTML")
+            return
+            
+        ch_id = args[1]
+        key = args[2].lower()
+        
+        # Everything after key is the new value
+        value = " ".join(args[3:])
+        
+        allowed_keys = ['name', 'amount', 'channel_id', 'duration']
+        if key not in allowed_keys:
+            bot.reply_to(message, f"❌ Invalid key! Use: {', '.join(allowed_keys)}")
+            return
+            
+        found = False
+        for ch in settings.get('premium_channels', []):
+            if ch['id'] == ch_id:
+                ch[key] = value
+                found = True
+                break
+                    
+        if found:
+            save_settings()
+            bot.reply_to(message, f"✅ Updated <b>{key}</b> for <b>{ch_id}</b> to: <code>{value}</code>", parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"❌ Channel ID {ch_id} not found.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
+
+@bot.message_handler(commands=['set_price'])
+def handle_set_price(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "Usage: <code>/set_price single/all amount</code>", parse_mode="HTML")
+        return
+        
+    type_ = args[1].lower()
+    amount = args[2]
+    
+    if type_ == "single":
+        settings['ch_price'] = amount
+        bot.reply_to(message, f"✅ Single channel price set to <b>₹{amount}</b>.", parse_mode="HTML")
+    elif type_ == "all":
+        settings['all_price'] = amount
+        bot.reply_to(message, f"✅ All channels price set to <b>₹{amount}</b>.", parse_mode="HTML")
+    else:
+        bot.reply_to(message, "Invalid type. Use 'single' or 'all'.")
+        return
+        
+    save_settings()
+
+@bot.message_handler(commands=['set_ch'])
+def handle_set_ch(message):
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "Usage: <code>/set_ch 1-7 channel_id</code>", parse_mode="HTML")
+        return
+        
+    ch_num = args[1]
+    ch_id = args[2]
+    
+    if ch_num not in [str(i) for i in range(1, 8)]:
+        bot.reply_to(message, "Invalid channel number. Use 1-7.")
+        return
+        
+    settings[f'ch{ch_num}_id'] = ch_id
+    save_settings()
+    bot.reply_to(message, f"✅ Channel {ch_num} ID set to <code>{ch_id}</code>.", parse_mode="HTML")
+
+@bot.message_handler(commands=['imp_to_mongo'])
+def handle_imp_to_mongo(message):
+    """Import data from a JSON file directly to MongoDB via reply with merging"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    if not message.reply_to_message or not message.reply_to_message.document:
+        bot.reply_to(message, "❌ <b>Usage:</b> Reply to a JSON file with <code>/imp_to_mongo</code>", parse_mode="HTML")
+        return
+    
+    try:
+        status_msg = bot.reply_to(message, "⏳ <b>Processing file...</b>", parse_mode="HTML")
+        
+        file_info = bot.get_file(message.reply_to_message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Parse JSON
+        imported_data = json.loads(downloaded_file.decode('utf-8'))
+        filename = message.reply_to_message.document.file_name.lower()
+        
+        collection_name = ""
+        # Determine collection name based on filename OR content
+        if "user" in filename or (isinstance(imported_data, dict) and any(k.isdigit() for k in list(imported_data.keys())[:5]) and "username" in str(list(imported_data.values())[0])):
+            collection_name = "users_data"
+        elif "setting" in filename or (isinstance(imported_data, dict) and "upi_id" in imported_data):
+            collection_name = "settings"
+        elif "spam" in filename or (isinstance(imported_data, dict) and any(k.isdigit() for k in list(imported_data.keys())[:5]) and "spam_count" in str(list(imported_data.values())[0])):
+            collection_name = "spam_data"
+        elif "request" in filename or (isinstance(imported_data, list) and all(isinstance(i, int) for i in imported_data[:5])):
+            collection_name = "join_requests"
+        elif "pending" in filename or (isinstance(imported_data, dict) and any(k.isdigit() for k in list(imported_data.keys())[:5]) and "screenshot_file_id" in str(list(imported_data.values())[0])):
+            collection_name = "pending_verifications"
+        elif "link" in filename or (isinstance(imported_data, dict) and any(k.isdigit() for k in list(imported_data.keys())[:5]) and isinstance(list(imported_data.values())[0], (list, str))):
+            collection_name = "invite_links"
+        elif "start" in filename or (isinstance(imported_data, dict) and "custom_text" in imported_data):
+            collection_name = "start_message"
+
+        # 1. Handle Full Export File
+        if not collection_name and "users" in imported_data and isinstance(imported_data["users"], dict):
+            merged_count = 0
+            for key in ["users", "spam_data", "pending", "settings", "join_requests"]:
+                val = imported_data.get(key)
+                if val:
+                    col_map = {"users": "users_data", "pending": "pending_verifications"}
+                    target_col = col_map.get(key, key)
+                    
+                    # Merge Logic
+                    current_db_data = db_load(target_col, {} if isinstance(val, dict) else [])
+                    if isinstance(val, dict):
+                        current_db_data.update(val)
+                    elif isinstance(val, list):
+                        current_db_data = list(set(current_db_data + val))
+                    
+                    db_save(target_col, current_db_data)
+                    merged_count += 1
+            
+            bot.edit_message_text(f"✅ <b>Full Export Merged!</b>\nMerged {merged_count} modules into MongoDB successfully.", chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+            return
+
+        # 2. Handle Single Module File
+        if not collection_name:
+            bot.edit_message_text("❌ <b>Error:</b> Could not determine data type from filename. Rename file to <code>users_data.json</code> etc.", chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+            return
+
+        # Merge Logic for Single File
+        current_db_data = db_load(collection_name, {} if isinstance(imported_data, dict) else [])
+        item_count = 0
+        
+        if isinstance(imported_data, dict):
+            current_db_data.update(imported_data)
+            item_count = len(imported_data)
+            # Special handling for globals
+            if collection_name == "settings":
+                global settings
+                settings.update(imported_data)
+            elif collection_name == "users_data":
+                global users_data
+                users_data.update(imported_data)
+        elif isinstance(imported_data, list):
+            current_db_data = list(set(current_db_data + imported_data))
+            item_count = len(imported_data)
+            if collection_name == "join_requests":
+                global join_requests
+                join_requests = current_db_data
+
+        if db_save(collection_name, current_db_data):
+            bot.edit_message_text(f"✅ <b>Import & Merge Successful!</b>\n<b>Collection:</b> <code>{collection_name}</code>\n<b>New Items Merged:</b> {item_count}", chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+        else:
+            bot.edit_message_text("❌ <b>MongoDB Merge Failed!</b>", chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+            
+    except Exception as e:
+        bot.edit_message_text(f"❌ <b>Error:</b> {str(e)}", chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+
+@bot.message_handler(commands=['migrate_to_mongo'])
+def handle_migrate_to_mongo(message):
+    """Manually migrate all local JSON data to MongoDB"""
+    if not is_admin(message.from_user.id):
+        return
+
+    msg = bot.reply_to(message, "⏳ <b>Migration started...</b>", parse_mode="HTML")
+
+    success, result = force_migrate_to_mongodb()
+
+    if success:
+        files_str = ", ".join(result) if result else "None"
+        bot.edit_message_text(
+            f"✅ <b>Migration Successful!</b>\n\n<b>Migrated:</b> {files_str}\n\nData is now synced with MongoDB.",
+            chat_id=message.chat.id,
+            message_id=msg.message_id,
+            parse_mode="HTML"
+        )
+    else:
+        bot.edit_message_text(
+            f"❌ <b>Migration Failed:</b> {result}",
+            chat_id=message.chat.id,
+            message_id=msg.message_id,
+            parse_mode="HTML"
+        )
+
+# Force join logic removed
+
+# ========== /EXPORTDATA COMMAND ==========
+@bot.message_handler(commands=['exportdata'])
+def handle_export_data(message):
+    """Export all data as JSON"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        status_msg = bot.reply_to(message, "📥 Preparing export...", parse_mode="HTML")
+        
+        export_data = {
+            "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_users": len(users_data),
+            "users": users_data,
+            "spam_data": spam_data,
+            "pending": pending_verifications
+        }
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"export_{timestamp}.json"
+        filepath = os.path.join(DATA_DIR, filename)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=4)
+        
+        with open(filepath, 'rb') as f:
+            bot.send_document(
+                message.chat.id,
+                f,
+                caption=f"📊 Export: {len(users_data)} users\n⏰ {timestamp}"
+            )
+        
+        bot.delete_message(message.chat.id, status_msg.message_id)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Export failed: {str(e)}")
+
+# ========== /IMPDATA COMMAND ==========
+@bot.message_handler(commands=['impdata'])
+def handle_impdata(message):
+    """Import data from JSON file"""
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ Admin access required!")
+        return
+    
+    if not message.reply_to_message or not message.reply_to_message.document:
+        bot.reply_to(message, "❌ Reply to a JSON file with /impdata")
+        return
+    
+    try:
+        status_msg = bot.reply_to(message, "📥 Downloading file...", parse_mode="HTML")
+        
+        file_info = bot.get_file(message.reply_to_message.document.file_id)
+        file_name = message.reply_to_message.document.file_name
+        
+        if not file_name.lower().endswith('.json'):
+            bot.edit_message_text("❌ File must be JSON", chat_id=message.chat.id, message_id=status_msg.message_id)
+            return
+        
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        temp_path = f"/tmp/{file_name}"
+        with open(temp_path, 'wb') as f:
+            f.write(downloaded_file)
+        
+        with open(temp_path, 'r', encoding='utf-8') as f:
+            imported_data = json.load(f)
+        
+        users_before = len(users_data)
+        imported_count = 0
+        updated_count = 0
+        
+        # Handle different formats
+        if "users" in imported_data:
+            data_to_import = imported_data["users"]
+        else:
+            data_to_import = imported_data
+        
+        for user_id_str, user_data in data_to_import.items():
+            if user_id_str in users_data:
+                users_data[user_id_str].update(user_data)
+                updated_count += 1
+            else:
+                users_data[user_id_str] = user_data
+                imported_count += 1
+        
+        save_users_data()
+        os.remove(temp_path)
+        
+        success_msg = f"""
+✅ <b>IMPORT COMPLETE!</b>
+
+• Before: {users_before}
+• After: {len(users_data)}
+• New: {imported_count}
+• Updated: {updated_count}
+        """
+        
+        bot.edit_message_text(
+            success_msg, 
+            chat_id=message.chat.id, 
+            message_id=status_msg.message_id, 
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        bot.edit_message_text(
+            f"❌ Error: {str(e)}", 
+            chat_id=message.chat.id, 
+            message_id=status_msg.message_id
+        )
+
+# ========== /BACKUP COMMAND ==========
+@bot.message_handler(commands=['backup'])
+def handle_backup(message):
+    """Create data backup"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        backup_data = {
+            "users": users_data,
+            "spam": spam_data,
+            "pending": pending_verifications,
+            "backup_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = f"backup_{timestamp}.json"
+        backup_path = os.path.join(DATA_DIR, backup_file)
+        
+        with open(backup_path, 'w') as f:
+            json.dump(backup_data, f, indent=4)
+        
+        with open(backup_path, 'rb') as f:
+            bot.send_document(
+                message.chat.id, 
+                f, 
+                caption=f"📦 Backup: {len(users_data)} users\n⏰ {timestamp}"
+            )
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Backup failed: {str(e)}")
+
+# ========== /SAVEDATA COMMAND ==========
+@bot.message_handler(commands=['savedata'])
+def handle_save_data(message):
+    """Force save all data"""
+    if not is_admin(message.from_user.id):
+        return
+
+    try:
+        save_all_data()
+        bot.reply_to(
+            message, 
+            f"✅ All data saved!\n👥 Users: {len(users_data)}\n💾 Location: {DATA_DIR}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        bot.reply_to(message, f"❌ Save failed: {str(e)}")
+
+# ========== /CLEANBACKUPS COMMAND ==========
+@bot.message_handler(commands=['cleanbackups'])
+def handle_clean_backups(message):
+    """Clean old backup files"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        backup_files = [f for f in os.listdir(DATA_DIR) if f.startswith('backup_') and f.endswith('.json')]
+        backup_files.sort(key=lambda x: os.path.getmtime(os.path.join(DATA_DIR, x)))
+        
+        if len(backup_files) <= 5:
+            bot.reply_to(message, f"✅ Only {len(backup_files)} backups found (keeping all)")
+            return
+        
+        files_to_delete = backup_files[:-5]
+        deleted_count = 0
+        deleted_size = 0
+        
+        for filename in files_to_delete:
+            filepath = os.path.join(DATA_DIR, filename)
+            file_size = os.path.getsize(filepath)
+            os.remove(filepath)
+            deleted_count += 1
+            deleted_size += file_size
+        
+        result_msg = f"""
+🧹 <b>CLEANUP COMPLETE</b>
+
+📁 Deleted: {deleted_count} files
+💾 Freed: {deleted_size//1024} KB
+📊 Remaining: {len(backup_files) - deleted_count} backups
+        """
+        
+        bot.reply_to(message, result_msg, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Cleanup failed: {str(e)}")
+
+# ========== /SETSTARTMSG COMMAND ==========
+@bot.message_handler(commands=['setstartmsg'])
+def handle_set_start_message(message):
+    """Set custom start message"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    if not message.reply_to_message:
+        bot.reply_to(message, "❌ Reply to a message with /setstartmsg")
+        return
+    
+    replied_msg = message.reply_to_message
+    
+    start_message_data['text'] = replied_msg.caption or replied_msg.text or ""
+    start_message_data['has_media'] = False
+    
+    if replied_msg.photo:
+        start_message_data['media_type'] = 'photo'
+        start_message_data['file_id'] = replied_msg.photo[-1].file_id
+        start_message_data['has_media'] = True
+    elif replied_msg.video:
+        start_message_data['media_type'] = 'video'
+        start_message_data['file_id'] = replied_msg.video.file_id
+        start_message_data['has_media'] = True
+    elif replied_msg.document:
+        start_message_data['media_type'] = 'document'
+        start_message_data['file_id'] = replied_msg.document.file_id
+        start_message_data['has_media'] = True
+    
+    save_start_message()
+    bot.reply_to(message, "✅ Start message updated!")
+
+# ========== /GETSTARTMSG COMMAND ==========
+@bot.message_handler(commands=['getstartmsg'])
+def handle_get_start_message(message):
+    """View current start message"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    if not start_message_data:
+        bot.reply_to(message, "❌ No custom start message set")
+        return
+    
+    media_type = start_message_data.get('media_type', 'text')
+    has_media = start_message_data.get('has_media', False)
+    text_preview = start_message_data.get('text', '')[:100]
+    if len(start_message_data.get('text', '')) > 100:
+        text_preview += "..."
+    
+    info_msg = f"""
+<b>📋 CURRENT START MESSAGE</b>
+
+<b>Type:</b> {media_type if has_media else 'Text Only'}
+<b>Has Media:</b> {'✅ Yes' if has_media else '❌ No'}
+<b>Preview:</b> {text_preview}
+    """
+    
+    bot.reply_to(message, info_msg, parse_mode="HTML")
+
+# ========== /CLEARSTARTMSG COMMAND ==========
+@bot.message_handler(commands=['clearstartmsg'])
+def handle_clear_start_message(message):
+    """Clear custom start message"""
+    if not is_admin(message.from_user.id):
+        return
+
+    global start_message_data
+    start_message_data = {}
+    save_start_message()
+    bot.reply_to(message, "✅ Custom start message cleared")
+
+# ========== /PENDING COMMAND ==========
+@bot.message_handler(commands=['pending'])
+def handle_pending(message):
+    """Show pending verifications"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    if not pending_verifications:
+        bot.reply_to(message, "✅ No pending verifications")
+        return
+    
+    text = "<b>⏳ PENDING VERIFICATIONS:</b>\n\n"
+    for uid, data in pending_verifications.items():
+        plan_id = data['plan']
+        plan_name = config.PLANS[plan_id]['name'] if plan_id in config.PLANS else plan_id
+        text += f"👤 Name: {data.get('first_name', 'N/A')}\n"
+        text += f"👤 ID: <code>{uid}</code>\n"
+        text += f"📅 Plan: {plan_name}\n"
+        text += f"💰 Amount: ₹{data['amount']}\n"
+        text += f"⏰ Time: {data['initiated_at']}\n"
+        text += f"📸 Screenshot: {'✅' if 'screenshot_file_id' in data else '❌'}\n"
+        text += "───────────────\n"
+    
+    # Split if too long
+    if len(text) > 4000:
+        parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        for part in parts:
+            bot.send_message(message.chat.id, part, parse_mode="HTML")
+    else:
+        bot.reply_to(message, text, parse_mode="HTML")
+
+# ========== /HELP COMMAND (FIXED HTML) ==========
+@bot.message_handler(commands=['help'])
+def handle_help(message):
+    """Show help message"""
+    if not is_admin(message.from_user.id):
+        # User help
+        user_help = f"""
+<b>🤖 Bot Commands:</b>
+
+/start - Start the bot
+/help - Show this help
+
+For premium: Click "Get Premium" button
+
+<b>Demo Channel:</b> {settings['demo_channel_link']}
+        """
+        bot.reply_to(message, user_help, parse_mode="HTML")
+        return
+    
+    # Admin help
+    admin_help = """
+<b>👮 ADMIN COMMANDS</b>
+
+<b>📋 VERIFICATION:</b>
+/pending - Show pending verifications
+/verify [user_id] - Manual verify
+
+<b>⚙️ SETTINGS:</b>
+/settings - View all settings
+/set [key] [value] - Change setting
+
+<b>� PRICE MANAGEMENT:</b>
+/set_price single [amount] - Set single channel price (e.g. /set_price single 99)
+/set_price all [amount] - Set all channels price (e.g. /set_price all 299)
+/demo_price [amount] - Set demo price
+/set_demo_ch [channel_id] - Set demo channel ID
+/set_demo_link [url] - Set demo link
+/demo_toggle - Toggle demo between FREE and PAID
+/set_proof_link [url] - Set payment proof channel link
+/proof_toggle - Toggle payment proof button ON/OFF
+/set_backup_ch [id] - Set backup channel for videos
+
+<b>📺 CHANNEL MANAGEMENT:</b>
+/add_premium_ch id Full Name price channel_id - Add new channel
+/remove_premium_ch id - Remove channel
+/edit_premium_ch id key New Value - Edit channel (name, amount, channel_id, duration)
+/set_start_demos [v1] [v2]... - Set start demos
+/clear_start_demos - Clear start demos
+/set_plan_demos [plan] [v1]... - Set plan demos
+/clear_plan_demos [plan] - Clear plan demos
+
+<b>📢 BROADCAST:</b>
+/broadcast (reply) - Broadcast message
+
+<b>📊 DATA:</b>
+/stats - Bot statistics
+/sales - View daily/weekly/monthly sales report
+/migrate_to_mongo - Force sync JSON files to MongoDB
+/imp_to_mongo (reply) - Import specific JSON file to MongoDB
+/exportdata - Export users data
+/impdata (reply) - Import data
+/backup - Create backup
+/savedata - Force save
+/cleanbackups - Clean old backups
+
+<b>👑 ADMIN MANAGEMENT:</b>
+/add_admin [user_id] - Add new admin
+/remove_admin [user_id] - Remove admin
+/settings - View all settings
+
+<b>✏️ START MESSAGE:</b>
+/setstartmsg (reply) - Set custom start
+/getstartmsg - View current
+/clearstartmsg - Clear custom
+
+<b>ℹ️ OTHER:</b>
+/help - Show this help
+    """
+    
+    # Split if too long
+    if len(admin_help) > 4000:
+        parts = [admin_help[i:i+4000] for i in range(0, len(admin_help), 4000)]
+        for part in parts:
+            bot.send_message(message.chat.id, part, parse_mode="HTML")
+    else:
+        bot.reply_to(message, admin_help, parse_mode="HTML")
+
+# ========== SILENT HANDLER ==========
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    # Log user messages for debugging if needed
+    # logging.debug(f"Received message: {message.text} from {message.from_user.id}")
+    pass
+
+# ========== START BOT ==========
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🤖 PREMIUM BOT - TWO CHANNELS + DYNAMIC CONFIG")
+    print("=" * 60)
+    
+    print(f"✅ Bot Token: {BOT_TOKEN[:15]}...")
+    print(f"✅ Admin IDs: {', '.join(settings.get('admin_ids', []))}")
+    print(f"✅ Users Loaded: {len(users_data)}")
+    print(f"✅ Pending: {len(pending_verifications)}")
+    print(f"✅ Single Channel Price: ₹{settings.get('ch_price', '99')}")
+    print(f"✅ All Channels Price: ₹{settings.get('all_price', '299')}")
+    print("=" * 60)
+    print("📋 Type /help for all commands")
+    print("📋 Type /settings to view/edit config")
+    print("=" * 60)
+    
+    try:
+        print("🚀 Bot is starting polling...")
+        bot.infinity_polling(
+            timeout=60, 
+            long_polling_timeout=60,
+            allowed_updates=["message", "callback_query", "chat_member", "chat_join_request"]
+        )
+    except Exception as e:
+        print(f"Bot Error: {e}")
+        time.sleep(10)
+        sys.exit(1)
