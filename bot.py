@@ -102,25 +102,28 @@ def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=
     timer.start()
     logging.info(f"Scheduled deletion for message {message_id} in {chat_id} after {delay} seconds")
 
-def send_demo_videos(chat_id, video_list):
+def send_demo_videos(chat_id, video_list, caption=""):
     """Send a group of demo videos/photos (multi-group if > 10) and schedule deletion"""
     if not video_list:
         return
     
     # Process all items into a list of InputMedia
     all_media = []
-    for item in video_list:
+    for idx, item in enumerate(video_list):
         try:
+            # Set caption only for the first item in the group
+            item_caption = caption if idx == 0 else ""
+            
             if isinstance(item, dict):
                 fid = item.get('id')
                 ftype = item.get('type', 'video')
                 if ftype == 'photo':
-                    all_media.append(types.InputMediaPhoto(fid))
+                    all_media.append(types.InputMediaPhoto(fid, caption=item_caption, parse_mode="HTML"))
                 else:
-                    all_media.append(types.InputMediaVideo(fid))
+                    all_media.append(types.InputMediaVideo(fid, caption=item_caption, parse_mode="HTML"))
             else:
                 # Fallback for old string format
-                all_media.append(types.InputMediaVideo(item))
+                all_media.append(types.InputMediaVideo(item, caption=item_caption, parse_mode="HTML"))
         except Exception as e:
             logging.error(f"Error preparing media item: {e}")
             continue
@@ -131,6 +134,12 @@ def send_demo_videos(chat_id, video_list):
     # Split into chunks of 10 (Telegram limit for media group)
     for i in range(0, len(all_media), 10):
         chunk = all_media[i:i + 10]
+        # Reset caption for subsequent groups if needed
+        # (Already handled by idx logic above, but i logic is better for multi-groups)
+        if i > 0:
+            for m in chunk:
+                m.caption = ""
+
         try:
             msgs = bot.send_media_group(chat_id, chunk)
             # Schedule deletion for each message in the group
@@ -417,7 +426,8 @@ def handle_start(message):
         # NEW: Send Start Demo Videos (Deleted after 10 min)
         start_demos = settings.get('start_demo_videos', [])
         if start_demos:
-            send_demo_videos(message.chat.id, start_demos)
+            start_desc = settings.get('start_demo_desc', "")
+            send_demo_videos(message.chat.id, start_demos, caption=start_desc)
             
         is_new_user = str(user_id) not in users_data
         
@@ -547,7 +557,8 @@ def handle_plan_selection(call):
     # NEW: Send Plan Demo Videos (Multi-group support)
     plan_demos = settings.get('plan_demo_videos', {}).get(plan_type, [])
     if plan_demos:
-        send_demo_videos(chat_id, plan_demos)
+        plan_desc = settings.get('plan_demo_descs', {}).get(plan_type, "")
+        send_demo_videos(chat_id, plan_demos, caption=plan_desc)
     
     # NEW: Show Plan Description instead of QR
     desc_text = f"""
@@ -1509,10 +1520,64 @@ def handle_clear_plan_demos(message):
     plan_id = args[1]
     if 'plan_demo_videos' in settings and plan_id in settings['plan_demo_videos']:
         del settings['plan_demo_videos'][plan_id]
+        # Also clear description
+        if 'plan_demo_descs' in settings and plan_id in settings['plan_demo_descs']:
+            del settings['plan_demo_descs'][plan_id]
         save_settings()
-        bot.reply_to(message, f"✅ Cleared demo videos for plan: <code>{plan_id}</code>", parse_mode="HTML")
+        bot.reply_to(message, f"✅ Cleared demo videos & desc for plan: <code>{plan_id}</code>", parse_mode="HTML")
     else:
         bot.reply_to(message, f"❌ No demo videos found for plan: <code>{plan_id}</code>", parse_mode="HTML")
+
+@bot.message_handler(commands=['set_demo_desc'])
+def handle_set_demo_desc(message):
+    """Set description for demo album. Usage: /set_demo_desc [start/plan_id] [Description]"""
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        bot.reply_to(message, "Usage: <code>/set_demo_desc [start/plan_id] [Your Description]</code>", parse_mode="HTML")
+        return
+        
+    target = args[1].lower()
+    desc = args[2]
+    
+    if target == 'start':
+        settings['start_demo_desc'] = desc
+        bot.reply_to(message, "✅ /start demo description updated!")
+    else:
+        if 'plan_demo_descs' not in settings:
+            settings['plan_demo_descs'] = {}
+        settings['plan_demo_descs'][target] = desc
+        bot.reply_to(message, f"✅ Demo description for plan <code>{target}</code> updated!", parse_mode="HTML")
+    
+    save_settings()
+
+@bot.message_handler(commands=['clear_demo_desc'])
+def handle_clear_demo_desc(message):
+    """Clear description for demo album. Usage: /clear_demo_desc [start/plan_id]"""
+    if not is_admin(message.from_user.id):
+        return
+        
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "Usage: <code>/clear_demo_desc [start/plan_id]</code>", parse_mode="HTML")
+        return
+        
+    target = args[1].lower()
+    
+    if target == 'start':
+        settings['start_demo_desc'] = ""
+        bot.reply_to(message, "✅ /start demo description cleared!")
+    else:
+        if 'plan_demo_descs' in settings and target in settings['plan_demo_descs']:
+            del settings['plan_demo_descs'][target]
+            bot.reply_to(message, f"✅ Demo description for plan <code>{target}</code> cleared!", parse_mode="HTML")
+        else:
+            bot.reply_to(message, "❌ No description found to clear.")
+            return
+            
+    save_settings()
 
 @bot.message_handler(commands=['add_premium_ch'])
 def handle_add_premium_ch(message):
@@ -2137,6 +2202,8 @@ For premium: Click "Get Premium" button
 /clear_start_demos - Clear start demos
 /set_plan_demos [plan] [v1]... - Set plan demos
 /clear_plan_demos [plan] - Clear plan demos
+/set_demo_desc [id] [desc] - Set album caption
+/clear_demo_desc [id] - Clear album caption
 
 <b>📢 BROADCAST:</b>
 /broadcast (reply) - Broadcast message
