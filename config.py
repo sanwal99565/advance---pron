@@ -158,6 +158,8 @@ DEFAULT_SETTINGS = {
     "total_orders": 0, 
     "start_demo_videos": [], # List of video file_ids or links for /start
     "plan_demo_videos": {}, # Dict mapping plan_id to list of videos
+    "start_demo_desc": "", # Description for /start demo album
+    "plan_demo_descs": {}, # Dict mapping plan_id to description
     "premium_channels": [
         {"id": "ch1", "name": "Channel 1", "amount": "99", "channel_id": "", "duration": "30 Days"},
         {"id": "ch2", "name": "Channel 2", "amount": "99", "channel_id": "", "duration": "30 Days"},
