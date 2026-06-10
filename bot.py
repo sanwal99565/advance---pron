@@ -103,48 +103,49 @@ def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=
     logging.info(f"Scheduled deletion for message {message_id} in {chat_id} after {delay} seconds")
 
 def send_demo_videos(chat_id, video_list):
-    """Send a group of demo videos/photos and schedule deletion after 10 minutes"""
+    """Send a group of demo videos/photos (multi-group if > 10) and schedule deletion"""
     if not video_list:
         return
     
-    media = []
+    # Process all items into a list of InputMedia
+    all_media = []
     for item in video_list:
         try:
             if isinstance(item, dict):
                 fid = item.get('id')
                 ftype = item.get('type', 'video')
                 if ftype == 'photo':
-                    media.append(types.InputMediaPhoto(fid))
+                    all_media.append(types.InputMediaPhoto(fid))
                 else:
-                    media.append(types.InputMediaVideo(fid))
+                    all_media.append(types.InputMediaVideo(fid))
             else:
-                # OLD FORMAT HANDLING: Try to determine if it's a photo or video
-                # Since we can't know for sure without API call, we'll try to send as video first
-                # but this is what causes the 400 error if it's a photo.
-                # To fix this, we advise admin to CLEAR and RESET demos using new reply method.
-                media.append(types.InputMediaVideo(item))
+                # Fallback for old string format
+                all_media.append(types.InputMediaVideo(item))
         except Exception as e:
             logging.error(f"Error preparing media item: {e}")
             continue
     
-    if not media:
+    if not all_media:
         return
 
-    try:
-        msgs = bot.send_media_group(chat_id, media)
-        # Schedule deletion for each message in the group after 10 minutes (600s)
-        for m in msgs:
-            delete_message_after_delay(chat_id, m.message_id, delay=600)
-    except Exception as e:
-        logging.error(f"Error sending demo videos: {e}")
-        # Notify admin about the error if it's a type mismatch
-        if "can't use file of type Photo as Video" in str(e) or "can't use file of type Video as Photo" in str(e):
-            admin_ids = settings.get('admin_ids', [])
-            if admin_ids:
-                error_msg = "⚠️ <b>Demo Media Error!</b>\n\nSome of your demo files have the wrong type (Photo instead of Video or vice-versa).\n\n✅ <b>Solution:</b>\n1. Use <code>/clear_start_demos</code>\n2. Use <code>/clear_plan_demos [plan_id]</code>\n3. Set them again by <b>REPLYING</b> to the videos/photos."
-                for aid in admin_ids:
-                    try: bot.send_message(aid, error_msg, parse_mode="HTML")
-                    except: pass
+    # Split into chunks of 10 (Telegram limit for media group)
+    for i in range(0, len(all_media), 10):
+        chunk = all_media[i:i + 10]
+        try:
+            msgs = bot.send_media_group(chat_id, chunk)
+            # Schedule deletion for each message in the group
+            for m in msgs:
+                delete_message_after_delay(chat_id, m.message_id, delay=600)
+        except Exception as e:
+            logging.error(f"Error sending media group chunk: {e}")
+            # Notify admin if type mismatch
+            if "can't use file of type" in str(e):
+                admin_ids = settings.get('admin_ids', [])
+                if admin_ids:
+                    error_msg = "⚠️ <b>Demo Media Error!</b>\n\nSome files have wrong types. Please clear and reset using reply method."
+                    for aid in admin_ids:
+                        try: bot.send_message(aid, error_msg, parse_mode="HTML")
+                        except: pass
 
 def initialize_spam_data():
     """Ensure all existing users have spam_data entries"""
@@ -529,25 +530,81 @@ def handle_plan_selection(call):
     
     reset_spam_counter(user_id)
     
-    # Check if user already has a pending verification
-    if str(user_id) in pending_verifications:
-        existing = pending_verifications[str(user_id)]
-        if 'screenshot_file_id' in existing:
-            bot.answer_callback_query(
-                call.id,
-                "⚠️ You already have a pending verification! Please wait for admin to verify your previous payment.",
-                show_alert=True
-            )
-            return
-
     plan_type = call.data.split('_')[1]  # monthly or lifetime
-    plan = config.PLANS[plan_type]
+    
+    # NEW: Find plan in premium_channels list or config.PLANS
+    plan = None
+    if plan_type in config.PLANS:
+        plan = config.PLANS[plan_type]
+    else:
+        channels = settings.get("premium_channels", [])
+        plan = next((ch for ch in channels if ch['id'] == plan_type), None)
+        
+    if not plan:
+        bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
+        return
 
-    # NEW: Send Plan Demo Videos (Deleted after 10 min)
+    # NEW: Send Plan Demo Videos (Multi-group support)
     plan_demos = settings.get('plan_demo_videos', {}).get(plan_type, [])
     if plan_demos:
         send_demo_videos(chat_id, plan_demos)
     
+    # NEW: Show Plan Description instead of QR
+    desc_text = f"""
+<b>💎 {plan['name'].upper()} DESCRIPTION:</b>
+
+💰 <b>Amount:</b> ₹{plan['amount']}
+⏳ <b>Duration:</b> {plan.get('duration', 'N/A')}
+
+<b>Features:</b>
+✅ High Quality Content
+✅ Direct Access After Payment
+✅ 24/7 Support Available
+
+<i>Click "💳 Buy Now" below to get the payment QR code.</i>
+    """
+    
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    btn_buy = types.InlineKeyboardButton("💳 Buy Now", callback_data=f"buy_{plan_type}")
+    btn_back = types.InlineKeyboardButton("🔙 Back", callback_data="back_to_main")
+    keyboard.add(btn_buy, btn_back)
+    
+    try:
+        bot.edit_message_text(
+            desc_text,
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except:
+        bot.send_message(
+            chat_id,
+            desc_text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('buy_'))
+def handle_buy_now(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    plan_type = call.data.split('_')[1]
+    
+    # Find plan
+    plan = None
+    if plan_type in config.PLANS:
+        plan = config.PLANS[plan_type]
+    else:
+        channels = settings.get("premium_channels", [])
+        plan = next((ch for ch in channels if ch['id'] == plan_type), None)
+        
+    if not plan:
+        bot.answer_callback_query(call.id, "❌ Plan not found!", show_alert=True)
+        return
+
     # Increment total orders for sequential order number
     settings['total_orders'] = settings.get('total_orders', 0) + 1
     order_num = settings['total_orders']
@@ -562,23 +619,11 @@ def handle_plan_selection(call):
         'username': call.from_user.username,
         'first_name': call.from_user.first_name
     }
-    # save_json_file(PENDING_VERIF_FILE, pending_verifications) # Removed for batch saving
-    
-    # Log payment initiation
-    if str(user_id) in users_data:
-        log_important_event("payment_initiated", users_data[str(user_id)], f"{plan['name']} (Order #{order_num})")
-    
-    # Delete previous message
-    try:
-        bot.delete_message(chat_id, call.message.message_id)
-    except:
-        pass
     
     # Generate QR code
     qr_image = premium_bot.generate_qr_code(settings['upi_id'], plan['amount'], settings['upi_name'])
     
-    if qr_image:
-        caption = f"""
+    caption = f"""
 <b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
 
 <b>UPI Details:</b>
@@ -591,48 +636,47 @@ def handle_plan_selection(call):
 2. Pay ₹{plan['amount']}
 3. Click "✅ Payment Done" below
 
-⏳ <i>This QR will auto-delete in 5 minutes.</i>
-        """
-        
-        keyboard = types.InlineKeyboardMarkup(row_width=1)
-        btn1 = types.InlineKeyboardButton("✅ Payment Done", callback_data="payment_done")
-        keyboard.add(btn1)
-        
-        sent_msg = bot.send_photo(
-            chat_id,
-            photo=qr_image,
-            caption=caption,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-        # Auto-delete after 5 minutes
-        delete_message_after_delay(chat_id, sent_msg.message_id, 300, send_timeout_msg=True)
+⏳ <i>This QR will auto-delete in 10 minutes.</i>
+    """
+    
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    btn1 = types.InlineKeyboardButton("✅ Payment Done", callback_data="payment_done")
+    btn2 = types.InlineKeyboardButton("🔙 Back", callback_data=f"plan_{plan_type}")
+    keyboard.add(btn1, btn2)
+    
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except: pass
+
+    if qr_image:
+        sent_msg = bot.send_photo(chat_id, photo=qr_image, caption=caption, reply_markup=keyboard, parse_mode="HTML")
+        delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
     else:
-        manual_text = f"""
-<b>💰 ORDER #{order_num}: PAY ₹{plan['amount']} FOR {plan['name'].upper()}</b>
+        sent_msg = bot.send_message(chat_id, caption, reply_markup=keyboard, parse_mode="HTML")
+        delete_message_after_delay(chat_id, sent_msg.message_id, 600, send_timeout_msg=True)
+    
+    bot.answer_callback_query(call.id)
 
-<b>UPI ID:</b> <code>{settings['upi_id']}</code>
-<b>Amount:</b> ₹{plan['amount']}
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
+def handle_back_to_main(call):
+    try:
+        welcome_text = f"""
+🔥 <b>PREMIUM CONTENT</b> 🔥
 
-<b>Steps:</b>
-1. Send ₹{plan['amount']} to above UPI ID
-2. Click "✅ Payment Done" below
+Welcome to the Premium Bot! Access high-quality exclusive content.
 
-⏳ <i>This message will auto-delete in 5 minutes.</i>
+👇 <b>Select an option:</b>
         """
-        
-        keyboard = types.InlineKeyboardMarkup(row_width=1)
-        btn1 = types.InlineKeyboardButton("✅ Payment Done", callback_data="payment_done")
-        keyboard.add(btn1)
-        
-        sent_msg = bot.send_message(
-            chat_id,
-            manual_text,
-            reply_markup=keyboard,
+        bot.edit_message_text(
+            welcome_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=verif.main_menu_keyboard(),
             parse_mode="HTML"
         )
-        # Auto-delete after 5 minutes
-        delete_message_after_delay(chat_id, sent_msg.message_id, 300, send_timeout_msg=True)
+    except:
+        handle_start(call.message)
+    bot.answer_callback_query(call.id)
     
     bot.answer_callback_query(call.id)
 
