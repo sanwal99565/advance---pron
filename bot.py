@@ -1426,10 +1426,10 @@ def handle_set_start_demos(message):
         
         if reply.text:
             # Text message
-            item = {"type": "text", "text": reply.text_html or reply.text}
+            item = {"type": "text", "text": reply.text}
         elif reply.caption:
             # Caption with media
-            item = {"type": "text", "text": reply.caption_html or reply.caption}
+            item = {"type": "text", "text": reply.caption}
         elif reply.video:
             item = {"id": reply.video.file_id, "type": 'video'}
         elif reply.photo:
@@ -1503,9 +1503,9 @@ def handle_set_plan_demos(message):
         item = None
         
         if reply.text:
-            item = {"type": "text", "text": reply.text_html or reply.text}
+            item = {"type": "text", "text": reply.text}
         elif reply.caption:
-            item = {"type": "text", "text": reply.caption_html or reply.caption}
+            item = {"type": "text", "text": reply.caption}
         elif reply.video:
             item = {"id": reply.video.file_id, "type": 'video'}
         elif reply.photo:
