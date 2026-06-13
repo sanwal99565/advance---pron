@@ -1,4 +1,5 @@
 from bot import bot
+import telebot
 from flask import Flask, request
 import threading
 import os
@@ -15,7 +16,11 @@ app.logger.setLevel(logging.WARNING)
 
 # Run bot in background thread
 def run_bot():
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    bot.infinity_polling(
+        timeout=60,
+        long_polling_timeout=60,
+        allowed_updates=["message", "callback_query", "chat_member", "chat_join_request"]
+    )
 
 thread = threading.Thread(target=run_bot, daemon=True)
 thread.start()
