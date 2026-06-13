@@ -81,6 +81,20 @@ def notify_mongo_status():
 # Run notification in a separate thread to not block startup
 threading.Thread(target=notify_mongo_status, daemon=True).start()
 
+# Track demo messages for instant deletion
+user_demo_messages = {}
+
+def clear_user_demos(chat_id):
+    """Delete all tracked demo messages for a user immediately"""
+    chat_id_str = str(chat_id)
+    if chat_id_str in user_demo_messages:
+        for msg_id in user_demo_messages[chat_id_str]:
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except:
+                pass
+        user_demo_messages[chat_id_str] = []
+
 def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=False):
     """Delete a message after a specified delay and optionally send a timeout message"""
     def delete():
@@ -103,58 +117,79 @@ def delete_message_after_delay(chat_id, message_id, delay=300, send_timeout_msg=
     logging.info(f"Scheduled deletion for message {message_id} in {chat_id} after {delay} seconds")
 
 def send_demo_videos(chat_id, video_list, caption=""):
-    """Send a group of demo videos/photos (multi-group if > 10) and schedule deletion"""
+    """Send demo items (media or text) and schedule deletion"""
     if not video_list:
         return
     
-    # Process all items into a list of InputMedia
-    all_media = []
-    for idx, item in enumerate(video_list):
+    chat_id_str = str(chat_id)
+    if chat_id_str not in user_demo_messages:
+        user_demo_messages[chat_id_str] = []
+    
+    current_media_group = []
+    for item in video_list:
         try:
-            # Set caption only for the first item in the group
-            item_caption = caption if idx == 0 else ""
-            
-            if isinstance(item, dict):
+            # Check if it's a text item
+            if isinstance(item, dict) and item.get('type') == 'text':
+                # First send any pending media group
+                if current_media_group:
+                    for i in range(0, len(current_media_group), 10):
+                        chunk = current_media_group[i:i + 10]
+                        try:
+                            msgs = bot.send_media_group(chat_id, chunk)
+                            for m in msgs:
+                                user_demo_messages[chat_id_str].append(m.message_id)
+                                delete_message_after_delay(chat_id, m.message_id, delay=600)
+                        except Exception as e:
+                            logging.error(f"Error sending media group chunk: {e}")
+                    current_media_group = []
+                
+                # Send the text message
+                txt_msg = bot.send_message(chat_id, item.get('text', ''), parse_mode="HTML", disable_web_page_preview=False)
+                user_demo_messages[chat_id_str].append(txt_msg.message_id)
+                delete_message_after_delay(chat_id, txt_msg.message_id, delay=600)
+                
+            elif isinstance(item, dict):
                 fid = item.get('id')
                 ftype = item.get('type', 'video')
                 if ftype == 'photo':
-                    all_media.append(types.InputMediaPhoto(fid, caption=item_caption, parse_mode="HTML"))
-                else:
-                    all_media.append(types.InputMediaVideo(fid, caption=item_caption, parse_mode="HTML"))
+                    current_media_group.append(types.InputMediaPhoto(fid, parse_mode="HTML"))
+                elif ftype == 'video':
+                    current_media_group.append(types.InputMediaVideo(fid, parse_mode="HTML"))
             else:
                 # Fallback for old string format
-                all_media.append(types.InputMediaVideo(item, caption=item_caption, parse_mode="HTML"))
+                current_media_group.append(types.InputMediaVideo(item, parse_mode="HTML"))
         except Exception as e:
-            logging.error(f"Error preparing media item: {e}")
+            logging.error(f"Error preparing demo item: {e}")
             continue
     
-    if not all_media:
-        return
+    # Send any remaining media group
+    if current_media_group:
+        for i in range(0, len(current_media_group), 10):
+            chunk = current_media_group[i:i + 10]
+            try:
+                msgs = bot.send_media_group(chat_id, chunk)
+                for m in msgs:
+                    user_demo_messages[chat_id_str].append(m.message_id)
+                    delete_message_after_delay(chat_id, m.message_id, delay=600)
+            except Exception as e:
+                logging.error(f"Error sending media group chunk: {e}")
+                # Notify admin if type mismatch
+                if "can't use file of type" in str(e):
+                    admin_ids = settings.get('admin_ids', [])
+                    if admin_ids:
+                        error_msg = "⚠️ <b>Demo Media Error!</b>\n\nSome files have wrong types. Please clear and reset using reply method."
+                        for aid in admin_ids:
+                            try: bot.send_message(aid, error_msg, parse_mode="HTML")
+                            except: pass
 
-    # Split into chunks of 10 (Telegram limit for media group)
-    for i in range(0, len(all_media), 10):
-        chunk = all_media[i:i + 10]
-        # Reset caption for subsequent groups if needed
-        # (Already handled by idx logic above, but i logic is better for multi-groups)
-        if i > 0:
-            for m in chunk:
-                m.caption = ""
-
+    # Send Description as a separate message
+    if caption:
         try:
-            msgs = bot.send_media_group(chat_id, chunk)
-            # Schedule deletion for each message in the group
-            for m in msgs:
-                delete_message_after_delay(chat_id, m.message_id, delay=600)
+            desc_msg = bot.send_message(chat_id, caption, parse_mode="HTML")
+            user_demo_messages[chat_id_str].append(desc_msg.message_id)
+            delete_message_after_delay(chat_id, desc_msg.message_id, delay=600)
         except Exception as e:
-            logging.error(f"Error sending media group chunk: {e}")
-            # Notify admin if type mismatch
-            if "can't use file of type" in str(e):
-                admin_ids = settings.get('admin_ids', [])
-                if admin_ids:
-                    error_msg = "⚠️ <b>Demo Media Error!</b>\n\nSome files have wrong types. Please clear and reset using reply method."
-                    for aid in admin_ids:
-                        try: bot.send_message(aid, error_msg, parse_mode="HTML")
-                        except: pass
+            logging.error(f"Error sending separate demo description: {e}")
 
 def initialize_spam_data():
     """Ensure all existing users have spam_data entries"""
@@ -423,6 +458,9 @@ def handle_start(message):
             bot.send_message(message.chat.id, spam_result, parse_mode="HTML")
             return
 
+        # NEW: Clear old demo messages immediately
+        clear_user_demos(message.chat.id)
+
         # NEW: Send Start Demo Videos (Deleted after 10 min)
         start_demos = settings.get('start_demo_videos', [])
         if start_demos:
@@ -540,6 +578,9 @@ def handle_plan_selection(call):
     
     reset_spam_counter(user_id)
     
+    # NEW: Clear old demo messages immediately
+    clear_user_demos(chat_id)
+
     plan_type = call.data.split('_')[1]  # monthly or lifetime
     
     # NEW: Find plan in premium_channels list or config.PLANS
@@ -1374,60 +1415,65 @@ def handle_set_backup_ch(message):
 # ========== DEMO VIDEO MANAGEMENT ==========
 @bot.message_handler(commands=['set_start_demos'])
 def handle_set_start_demos(message):
-    """Set demo videos for /start. Support reply to media or space-separated file_ids."""
+    """Set demo items (media/text) for /start. Support reply to media/text or other methods."""
     if not is_admin(message.from_user.id):
         return
     
-    # 1. Handle Reply to Media
+    # 1. Handle Reply
     if message.reply_to_message:
         reply = message.reply_to_message
-        fid = None
-        ftype = None
+        item = None
         
-        if reply.video:
-            fid = reply.video.file_id
-            ftype = 'video'
+        if reply.text:
+            # Text message
+            item = {"type": "text", "text": reply.text_html or reply.text}
+        elif reply.caption:
+            # Caption with media
+            item = {"type": "text", "text": reply.caption_html or reply.caption}
+        elif reply.video:
+            item = {"id": reply.video.file_id, "type": 'video'}
         elif reply.photo:
-            fid = reply.photo[-1].file_id
-            ftype = 'photo'
+            item = {"id": reply.photo[-1].file_id, "type": 'photo'}
         elif reply.document:
             fid = reply.document.file_id
-            # Check if it's a photo or video based on mime_type
             mime = reply.document.mime_type or ""
-            if "video" in mime:
-                ftype = 'video'
-            elif "image" in mime:
+            ftype = 'video'
+            if "image" in mime:
                 ftype = 'photo'
-            else:
-                ftype = 'video' # Default fallback
+            item = {"id": fid, "type": ftype}
             
-        if fid:
+        if item:
             if 'start_demo_videos' not in settings:
                 settings['start_demo_videos'] = []
             
-            # Check if already in list
-            exists = any(isinstance(x, dict) and x.get('id') == fid for x in settings['start_demo_videos'])
-            if not exists:
-                settings['start_demo_videos'].append({"id": fid, "type": ftype})
-                save_settings()
-                bot.reply_to(message, f"✅ Added {ftype} to /start demos. Total: {len(settings['start_demo_videos'])}")
+            # Check duplicates
+            exists = False
+            if item.get('type') == 'text':
+                exists = any(x.get('type') == 'text' and x.get('text') == item.get('text') for x in settings['start_demo_videos'])
             else:
-                bot.reply_to(message, "❌ This media is already in the /start demos list.")
+                exists = any(x.get('type') != 'text' and x.get('id') == item.get('id') for x in settings['start_demo_videos'])
+                
+            if not exists:
+                settings['start_demo_videos'].append(item)
+                save_settings()
+                bot.reply_to(message, f"✅ Added {item.get('type')} to /start demos. Total: {len(settings['start_demo_videos'])}")
+            else:
+                bot.reply_to(message, "❌ This item is already in the /start demos list.")
         else:
-            bot.reply_to(message, "❌ Please reply to a video or photo to add it to demos.")
+            bot.reply_to(message, "❌ Please reply to a video/photo/text to add it to demos.")
         return
 
     # 2. Handle Space-separated file_ids (Overwrite mode)
     args = message.text.split()[1:]
-    if not args:
-        bot.reply_to(message, "Usage: Reply to a video/photo with <code>/set_start_demos</code>\nOR use <code>/set_start_demos file_id1 file_id2 ...</code>", parse_mode="HTML")
+    if args:
+        # Convert IDs to new format (assume video for IDs)
+        new_list = [{"id": fid, "type": "video"} for fid in args]
+        settings['start_demo_videos'] = new_list
+        save_settings()
+        bot.reply_to(message, f"✅ Set {len(args)} demo items for /start (Overwrite).")
         return
-    
-    # Convert IDs to new format (assume video for IDs)
-    new_list = [{"id": fid, "type": "video"} for fid in args]
-    settings['start_demo_videos'] = new_list
-    save_settings()
-    bot.reply_to(message, f"✅ Set {len(args)} demo videos for /start (Overwrite).")
+        
+    bot.reply_to(message, "Usage: Reply to video/photo/text with <code>/set_start_demos</code>\nOR use <code>/set_start_demos file_id1 file_id2 ...</code>", parse_mode="HTML")
 
 @bot.message_handler(commands=['clear_start_demos'])
 def handle_clear_start_demos(message):
@@ -1440,7 +1486,7 @@ def handle_clear_start_demos(message):
 
 @bot.message_handler(commands=['set_plan_demos'])
 def handle_set_plan_demos(message):
-    """Set demo videos for a plan. Support reply to media or space-separated file_ids."""
+    """Set demo items (media/text) for a plan. Support reply to media/text or space-separated file_ids."""
     if not is_admin(message.from_user.id):
         return
     
@@ -1451,61 +1497,64 @@ def handle_set_plan_demos(message):
         
     plan_id = args[1]
     
-    # 1. Handle Reply to Media (Append mode)
+    # 1. Handle Reply (Append mode)
     if message.reply_to_message:
         reply = message.reply_to_message
-        fid = None
-        ftype = None
+        item = None
         
-        if reply.video:
-            fid = reply.video.file_id
-            ftype = 'video'
+        if reply.text:
+            item = {"type": "text", "text": reply.text_html or reply.text}
+        elif reply.caption:
+            item = {"type": "text", "text": reply.caption_html or reply.caption}
+        elif reply.video:
+            item = {"id": reply.video.file_id, "type": 'video'}
         elif reply.photo:
-            fid = reply.photo[-1].file_id
-            ftype = 'photo'
+            item = {"id": reply.photo[-1].file_id, "type": 'photo'}
         elif reply.document:
             fid = reply.document.file_id
-            # Check mime_type
             mime = reply.document.mime_type or ""
-            if "video" in mime:
-                ftype = 'video'
-            elif "image" in mime:
+            ftype = 'video'
+            if "image" in mime:
                 ftype = 'photo'
-            else:
-                ftype = 'video'
+            item = {"id": fid, "type": ftype}
             
-        if fid:
+        if item:
             if 'plan_demo_videos' not in settings:
                 settings['plan_demo_videos'] = {}
             if plan_id not in settings['plan_demo_videos']:
                 settings['plan_demo_videos'][plan_id] = []
                 
-            # Check if already in list
-            exists = any(isinstance(x, dict) and x.get('id') == fid for x in settings['plan_demo_videos'][plan_id])
-            if not exists:
-                settings['plan_demo_videos'][plan_id].append({"id": fid, "type": ftype})
-                save_settings()
-                bot.reply_to(message, f"✅ Added {ftype} to demos for plan <code>{plan_id}</code>. Total: {len(settings['plan_demo_videos'][plan_id])}", parse_mode="HTML")
+            # Check duplicates
+            exists = False
+            if item.get('type') == 'text':
+                exists = any(x.get('type') == 'text' and x.get('text') == item.get('text') for x in settings['plan_demo_videos'][plan_id])
             else:
-                bot.reply_to(message, f"❌ This media is already in the demos list for plan <code>{plan_id}</code>.", parse_mode="HTML")
+                exists = any(x.get('type') != 'text' and x.get('id') == item.get('id') for x in settings['plan_demo_videos'][plan_id])
+                
+            if not exists:
+                settings['plan_demo_videos'][plan_id].append(item)
+                save_settings()
+                bot.reply_to(message, f"✅ Added {item.get('type')} to demos for plan <code>{plan_id}</code>. Total: {len(settings['plan_demo_videos'][plan_id])}", parse_mode="HTML")
+            else:
+                bot.reply_to(message, f"❌ This item is already in the demos list for plan <code>{plan_id}</code>.", parse_mode="HTML")
         else:
-            bot.reply_to(message, "❌ Please reply to a video or photo to add it to plan demos.")
+            bot.reply_to(message, "❌ Please reply to a video/photo/text to add it to plan demos.")
         return
 
     # 2. Handle Space-separated file_ids (Overwrite mode)
-    if len(args) < 3:
-        bot.reply_to(message, "Usage: Reply to a video/photo with <code>/set_plan_demos plan_id</code>\nOR use <code>/set_plan_demos plan_id file_id1 file_id2 ...</code>", parse_mode="HTML")
+    if len(args) >= 3:
+        video_ids = args[2:]
+        if 'plan_demo_videos' not in settings:
+            settings['plan_demo_videos'] = {}
+            
+        # Convert IDs to new format
+        new_list = [{"id": fid, "type": "video"} for fid in video_ids]
+        settings['plan_demo_videos'][plan_id] = new_list
+        save_settings()
+        bot.reply_to(message, f"✅ Set {len(video_ids)} demo items for plan: <code>{plan_id}</code> (Overwrite)", parse_mode="HTML")
         return
         
-    video_ids = args[2:]
-    if 'plan_demo_videos' not in settings:
-        settings['plan_demo_videos'] = {}
-        
-    # Convert IDs to new format
-    new_list = [{"id": fid, "type": "video"} for fid in video_ids]
-    settings['plan_demo_videos'][plan_id] = new_list
-    save_settings()
-    bot.reply_to(message, f"✅ Set {len(video_ids)} demo videos for plan: <code>{plan_id}</code> (Overwrite)", parse_mode="HTML")
+    bot.reply_to(message, "Usage: Reply to video/photo/text with <code>/set_plan_demos plan_id</code>\nOR use <code>/set_plan_demos plan_id file_id1 file_id2 ...</code>", parse_mode="HTML")
 
 @bot.message_handler(commands=['clear_plan_demos'])
 def handle_clear_plan_demos(message):
